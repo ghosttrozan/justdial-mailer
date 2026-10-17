@@ -16,18 +16,29 @@ const base = argv.find((arg) => !arg.startsWith('--')) || `http://localhost:${co
 const confirmed = flags.includes('--yes');
 
 /**
- * This test pushes real leads through the real endpoint, so with DRY_RUN=false
- * it sends REAL emails. Make that explicit before it happens.
+ * The emails are sent by the SERVER, not by this script. Setting DRY_RUN on
+ * the test process changes nothing, so the only honest way to know whether
+ * this will hit a real inbox is to ask the server itself.
  */
-if (!config.dryRun && config.mail.to.length && !confirmed) {
+let server = null;
+try {
+    const res = await fetch(`${base}${config.healthPath}`);
+    if (res.ok) server = await res.json();
+} catch {
+    // Unreachable - the checks below will fail on their own.
+}
+
+if (server && server.dryRun === false && !confirmed) {
+    const recipients = (server.mail?.to || []).join(', ') || '(unknown)';
+
     console.log('');
     console.log('STOP - this smoke test would send REAL emails.');
-    console.log(`  Recipient : ${config.mail.to.join(', ')}`);
-    console.log('  It fires one lead per input format, so you get several messages.');
+    console.log(`  Server   : ${base}`);
+    console.log(`  Sends to : ${recipients}`);
+    console.log('  It fires one lead per input format, so you would get several messages.');
     console.log('');
-    console.log('  To run it:');
-    console.log('    npm run test:smoke -- --yes       (send for real)');
-    console.log('    $env:DRY_RUN="true"; npm run test:smoke   (send nothing)');
+    console.log('  Run it anyway : npm run test:smoke -- --yes');
+    console.log('  Send nothing  : set DRY_RUN=true on the SERVER and restart it.');
     console.log('');
     process.exit(1);
 }

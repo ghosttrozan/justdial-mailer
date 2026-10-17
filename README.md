@@ -126,14 +126,16 @@ The reply should be `RECEIVED` and an email should land in `MAIL_TO`.
 **No SMTP yet?** Set `DRY_RUN=true` and the email content is printed to the
 console instead of being sent — perfect for a first run.
 
-**Heads up:** `npm run test:smoke` pushes real leads through the endpoint, so
-with `DRY_RUN=false` it sends **real emails** — one for each input format.
-It refuses to run until you pass `--yes`:
+**Heads up:** `npm run test:smoke` pushes real leads through the endpoint, and
+the **server** is what sends the emails. The test asks the server first and
+refuses to run while it is sending real mail:
 
 ```bash
-npm run test:smoke -- --yes              # send for real
-$env:DRY_RUN="true"; npm run test:smoke  # send nothing
+npm run test:smoke -- --yes     # run it anyway (sends real emails)
 ```
+
+To exercise everything without touching an inbox, start the server with
+`DRY_RUN=true` and then run the smoke test normally.
 
 **Preview the email design without sending anything:**
 
