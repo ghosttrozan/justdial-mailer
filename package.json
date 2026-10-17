@@ -1,0 +1,23 @@
+{
+  "name": "justdial-mailer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Receives JustDial leads on a public HTTP endpoint and forwards each lead by email. No CRM required.",
+  "type": "module",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test:lead": "node test/send-sample.js",
+    "test:smoke": "node test/smoke.js",
+    "test:smtp": "node test/check-smtp.js"
+  },
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "dotenv": "^16.4.5",
+    "nodemailer": "^6.9.14"
+  }
+}
