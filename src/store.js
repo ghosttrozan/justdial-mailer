@@ -5,15 +5,35 @@ import { config } from './config.js';
 import { log } from './logger.js';
 
 /**
- * The outbox: every lead is written here the moment it arrives, BEFORE we try
- * to email it. Nothing can be lost - not by a mail server outage, not by a
- * crash - because the lead is on disk before we answer JustDial.
+ * Two independent outboxes.
+ *
+ *   email     logs/outbox/            a lead waiting to be emailed
+ *   whatsapp  logs/outbox-whatsapp/   a lead waiting to be WhatsApped
+ *
+ * They are separate on purpose: if the mail server is down but WhatsApp is
+ * fine, the email must be retried WITHOUT re-sending the WhatsApp message, and
+ * the other way round.
+ *
+ * Nothing can be lost - not by a mail/WhatsApp outage, not by a crash - because
+ * the lead is on disk before we answer JustDial.
  */
-export const outboxDir = path.join(config.logs.dir, 'outbox');
+const QUEUE_DIRS = {
+    email: 'outbox',
+    whatsapp: 'outbox-whatsapp',
+};
+
+export function queueDir(kind = 'email') {
+    return path.join(config.logs.dir, QUEUE_DIRS[kind] || QUEUE_DIRS.email);
+}
+
+/** Kept for backwards compatibility - this is the email outbox. */
+export const outboxDir = queueDir('email');
 
 export function ensureDirs() {
     fs.mkdirSync(config.logs.dir, { recursive: true });
-    fs.mkdirSync(outboxDir, { recursive: true });
+    for (const kind of Object.keys(QUEUE_DIRS)) {
+        fs.mkdirSync(queueDir(kind), { recursive: true });
+    }
 }
 
 function dayStamp(date = new Date()) {
@@ -69,20 +89,24 @@ export function appendLead(lead, meta = {}) {
 }
 
 /**
- * Put a lead in the outbox. Returns { file, data } or null.
+ * Put a lead in one of the outboxes. Returns { file, data } or null.
+ * Any extra keys (for WhatsApp: the pending recipient list) are stored with it
+ * so a retry knows exactly what is left to do.
  */
-export function enqueue(lead, error = null) {
+export function enqueue(kind, lead, extra = {}) {
     ensureDirs();
 
     const safeId = String(lead.leadId || 'noleadid').replace(/[^a-z0-9_.-]/gi, '_').slice(0, 40);
-    const file = path.join(outboxDir, `${Date.now()}-${safeId}-${crypto.randomUUID().slice(0, 8)}.json`);
+    const file = path.join(queueDir(kind), `${Date.now()}-${safeId}-${crypto.randomUUID().slice(0, 8)}.json`);
 
     const data = {
+        kind,
         queued_at: new Date().toISOString(),
         attempts: 0,
         delivered: false,
         gave_up: false,
-        last_error: error ? String(error.message || error) : null,
+        last_error: null,
+        ...extra,
         lead: serializeLead(lead),
     };
 
@@ -90,17 +114,19 @@ export function enqueue(lead, error = null) {
         fs.writeFileSync(file, JSON.stringify(data, null, 2));
         return { file, data };
     } catch (writeError) {
-        log.error('Could not add the lead to the outbox', { error: writeError.message });
+        log.error(`Could not add the lead to the ${kind} outbox`, { error: writeError.message });
         return null;
     }
 }
 
-export function listQueued() {
+export function listQueued(kind = 'email') {
     ensureDirs();
+
+    const dir = queueDir(kind);
 
     let files = [];
     try {
-        files = fs.readdirSync(outboxDir).filter((name) => name.endsWith('.json'));
+        files = fs.readdirSync(dir).filter((name) => name.endsWith('.json'));
     } catch {
         return [];
     }
@@ -108,7 +134,7 @@ export function listQueued() {
     const out = [];
 
     for (const name of files) {
-        const file = path.join(outboxDir, name);
+        const file = path.join(dir, name);
         try {
             out.push({ file, data: JSON.parse(fs.readFileSync(file, 'utf8')) });
         } catch (error) {
@@ -138,9 +164,9 @@ export function removeQueued(file) {
     }
 }
 
-export function countQueued() {
+export function countQueued(kind = 'email') {
     try {
-        return fs.readdirSync(outboxDir).filter((name) => name.endsWith('.json')).length;
+        return fs.readdirSync(queueDir(kind)).filter((name) => name.endsWith('.json')).length;
     } catch {
         return 0;
     }

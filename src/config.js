@@ -21,6 +21,23 @@ function list(value) {
         .filter(Boolean);
 }
 
+/**
+ * The default WhatsApp message sent to a new lead.
+ *
+ * {{name}} {{category}} {{city}} {{company}} {{business}} {{mobile}} and more
+ * are replaced from the lead - see README section 10 for the full list.
+ */
+const DEFAULT_WHATSAPP_MESSAGE = [
+    'Namaste {{name}} ji,',
+    '',
+    'Aapne JustDial par enquiry ki thi ({{category}}).',
+    'Hum aapki puri madad kar sakte hain.',
+    '',
+    'Kya hum aapko ek call kar sakte hain?',
+    '',
+    '- {{business}}',
+].join('\n');
+
 export const config = {
     rootDir,
 
@@ -69,6 +86,56 @@ export const config = {
     // Pre-filled WhatsApp message when the "WhatsApp" button is tapped.
     whatsappGreeting: process.env.WHATSAPP_GREETING || 'Hello {{name}}, thank you for your enquiry on JustDial. How can we help you?',
 
+    // Shown in the WhatsApp message as {{business}}. Set it in .env.
+    businessName: (process.env.BUSINESS_NAME || '').trim(),
+
+    // ------------------------------------------------------------------
+    // WhatsApp sending (sends the lead to the customer's own number)
+    // ------------------------------------------------------------------
+    whatsapp: {
+        enabled: bool(process.env.WHATSAPP_ENABLED, false),
+
+        // 'openwa'  = the @open-wa/wa-automate library, in this process
+        // 'webhook' = POST the message to any WhatsApp HTTP gateway
+        provider: (process.env.WHATSAPP_PROVIDER || 'openwa').trim().toLowerCase(),
+
+        // --- provider: webhook ---
+        webhookUrl: (process.env.WHATSAPP_WEBHOOK_URL || '').trim(),
+        webhookToken: (process.env.WHATSAPP_WEBHOOK_TOKEN || '').trim(),
+
+        // --- provider: openwa ---
+        sessionId: (process.env.WHATSAPP_SESSION_ID || 'justdial-mailer').trim(),
+        sessionDir: path.isAbsolute(process.env.WHATSAPP_SESSION_DIR || '')
+            ? process.env.WHATSAPP_SESSION_DIR
+            : path.join(rootDir, process.env.WHATSAPP_SESSION_DIR || '.wa-session'),
+        headless: bool(process.env.WHATSAPP_HEADLESS, true),
+        chromePath: (process.env.WHATSAPP_CHROME_PATH || '').trim(),
+        licenseKey: (process.env.WHATSAPP_LICENSE_KEY || '').trim(),
+
+        // Escape hatch: extra open-wa options as JSON, merged last.
+        extraOptions: (process.env.WHATSAPP_OPENWA_OPTIONS || '').trim(),
+
+        // --- who gets messaged ---
+        sendToLead: bool(process.env.WHATSAPP_SEND_TO_LEAD, true),
+        teamNumbers: list(process.env.WHATSAPP_TEAM_NUMBERS),
+        blocklist: list(process.env.WHATSAPP_BLOCKLIST),
+        respectDnc: bool(process.env.WHATSAPP_RESPECT_DNC, true),
+
+        // --- the message ---
+        message: process.env.WHATSAPP_MESSAGE || DEFAULT_WHATSAPP_MESSAGE,
+
+        // --- pacing, so WhatsApp never sees a burst ---
+        minDelaySeconds: int(process.env.WHATSAPP_MIN_DELAY_SECONDS, 5),
+        maxDelaySeconds: int(process.env.WHATSAPP_MAX_DELAY_SECONDS, 15),
+
+        // --- retries ---
+        maxAttempts: int(process.env.WHATSAPP_MAX_ATTEMPTS, 5),
+
+        // How long a send waits for the WhatsApp client to come up before it
+        // gives up and lets the retry loop try again later.
+        startTimeoutSeconds: int(process.env.WHATSAPP_START_TIMEOUT_SECONDS, 120),
+    },
+
     logs: {
         dir: path.isAbsolute(process.env.LOG_DIR || '')
             ? process.env.LOG_DIR
@@ -96,6 +163,20 @@ export function validateConfig() {
     if (!config.smtp.pass) problems.push('SMTP_PASS is empty');
     if (!config.mail.to.length) problems.push('MAIL_TO is empty');
     if (!config.mail.from && !config.smtp.user) problems.push('MAIL_FROM is empty');
+
+    if (config.whatsapp.enabled) {
+        if (!['openwa', 'webhook'].includes(config.whatsapp.provider)) {
+            problems.push(`WHATSAPP_PROVIDER "${config.whatsapp.provider}" is not known (use openwa or webhook)`);
+        }
+
+        if (config.whatsapp.provider === 'webhook' && !config.whatsapp.webhookUrl) {
+            problems.push('WHATSAPP_WEBHOOK_URL is empty');
+        }
+
+        if (!config.whatsapp.sendToLead && !config.whatsapp.teamNumbers.length) {
+            problems.push('WhatsApp is on but nothing would receive a message');
+        }
+    }
 
     return problems;
 }

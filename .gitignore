@@ -3,3 +3,6 @@ node_modules/
 logs/
 *.log
 .DS_Store
+
+# WhatsApp (open-wa) session - whoever holds this holds the WhatsApp login.
+.wa-session/

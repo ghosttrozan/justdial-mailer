@@ -3,23 +3,29 @@
  * JustDial Mailer
  * --------------
  * A tiny standalone service: JustDial calls the endpoint with the lead fields,
- * we reply with the plain text "RECEIVED" straight away and forward the lead
- * to email in the background.
+ * we reply with the plain text "RECEIVED" straight away, and forward the lead
+ * to email - and optionally to the customer's own WhatsApp number - in the
+ * background.
  *
  *   GET / POST  {ENDPOINT_PATH}          <- the lead endpoint
  *   GET         {HEALTH_PATH}            <- health / status
+ *   GET         {COPY_PATH}              <- the "copy to clipboard" page
+ *   GET         /whatsapp/qr/{secret}    <- the WhatsApp QR image
  *
  * Delivery guarantee:
  *   1. the lead is written to logs/leads-YYYY-MM-DD.jsonl
- *   2. the lead is written to logs/outbox/  (on disk, before we reply)
- *   3. we reply "RECEIVED" to JustDial
- *   4. the email is sent in the background; the outbox entry is removed on
- *      success and retried later on failure
+ *   2. the lead is written to logs/outbox/ and logs/outbox-whatsapp/ BEFORE we
+ *      reply to JustDial
+ *   3. we reply "RECEIVED"
+ *   4. email and WhatsApp are sent in the background; a queue entry is removed
+ *      on success and retried later on failure
  *
- * That means JustDial never waits on our mail server, and no lead is lost even
- * if the mail server (or this process) goes down.
+ * That means JustDial never waits on our mail server or on WhatsApp, and no
+ * lead is lost even if either of them (or this process) goes down.
  */
+import fs from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
 import { config, leadUrl, validateConfig } from './src/config.js';
 import { collectInput, isUsable, normalize, parseMultipart } from './src/lead.js';
 import { sendLead, verifyTransport } from './src/mailer.js';
@@ -35,6 +41,15 @@ import {
     removeQueued,
     updateQueued,
 } from './src/store.js';
+import {
+    recipientsFor,
+    renderWhatsappMessage,
+    sendWhatsappText,
+    skipReason,
+    startWhatsapp,
+    stopWhatsapp,
+    whatsappStatus,
+} from './src/whatsapp.js';
 import { log } from './src/logger.js';
 
 const MAX_BODY_BYTES = 256 * 1024;
@@ -45,6 +60,20 @@ const leadPath = config.pathSecret
 
 /** Outbox entries currently being emailed (never send one twice). */
 const inFlight = new Set();
+
+/** Same, for the WhatsApp outbox. */
+const whatsappInFlight = new Set();
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A random pause between two WhatsApp messages, so we never look like a burst. */
+async function paceWhatsapp() {
+    const min = Math.max(0, config.whatsapp.minDelaySeconds);
+    const max = Math.max(min, config.whatsapp.maxDelaySeconds);
+    const ms = (min + Math.random() * (max - min)) * 1000;
+
+    if (ms > 0) await sleep(ms);
+}
 
 /** JustDial retries on timeout - optionally ignore the same lead id in a window. */
 const recentSends = new Map();
@@ -126,6 +155,36 @@ function handleCopy(res, url) {
 }
 
 /**
+ * The WhatsApp QR image, so it can be scanned from another device.
+ *
+ * Guarded by PATH_SECRET on purpose: anybody who could read this could link
+ * their own WhatsApp to this session.
+ */
+function handleQr(res) {
+    const status = whatsappStatus();
+    const file = status.qrFile ? path.join(config.logs.dir, status.qrFile) : null;
+
+    if (!file || !fs.existsSync(file)) {
+        return reply(res, 404, 'No QR code is waiting. See /health for the WhatsApp status.');
+    }
+
+    if (path.extname(file).toLowerCase() !== '.png') {
+        return reply(res, 200, fs.readFileSync(file, 'utf8'));
+    }
+
+    const image = fs.readFileSync(file);
+
+    res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Content-Length': image.length,
+        'Cache-Control': 'no-store',
+    });
+    res.end(image);
+
+    return undefined;
+}
+
+/**
  * Email one outbox entry. On success the entry is removed; on failure it stays
  * put with an extra attempt recorded so the retry loop can try again.
  */
@@ -172,6 +231,116 @@ async function deliverQueued(file, data) {
     }
 }
 
+/**
+ * Send the WhatsApp message(s) for one outbox entry.
+ *
+ * The entry keeps a `pending` list of numbers and a `sent_to` list, so a retry
+ * never re-messages somebody who already got it.
+ */
+async function deliverWhatsappQueued(file, data) {
+    if (whatsappInFlight.has(file)) return false;
+
+    whatsappInFlight.add(file);
+
+    try {
+        const lead = deserializeLead(data.lead);
+
+        const entry = {
+            ...data,
+            attempts: Number(data.attempts || 0) + 1,
+            sent_to: Array.isArray(data.sent_to) ? [...data.sent_to] : [],
+            pending: Array.isArray(data.pending) ? [...data.pending] : [],
+        };
+
+        if (!entry.pending.length) {
+            removeQueued(file);
+            return true;
+        }
+
+        const text = renderWhatsappMessage(lead);
+        let lastError = null;
+
+        while (entry.pending.length) {
+            const number = entry.pending[0];
+
+            try {
+                await sendWhatsappText(number, text);
+            } catch (error) {
+                lastError = error;
+                break; // keep this number for the next attempt
+            }
+
+            entry.sent_to.push(number);
+            entry.pending.shift();
+
+            log.info('WhatsApp message sent', {
+                leadId: lead.leadId || null,
+                to: number,
+                remaining: entry.pending.length,
+            });
+
+            if (entry.pending.length) await paceWhatsapp();
+        }
+
+        entry.last_error = lastError ? String(lastError.message || lastError) : null;
+
+        if (!entry.pending.length) {
+            removeQueued(file);
+
+            log.info('WhatsApp delivery complete', {
+                leadId: lead.leadId || null,
+                to: entry.sent_to,
+            });
+
+            return true;
+        }
+
+        entry.gave_up = entry.attempts >= config.whatsapp.maxAttempts;
+        updateQueued(file, entry);
+
+        log.error('WhatsApp message FAILED - kept in the outbox', {
+            leadId: lead.leadId || null,
+            to: entry.pending,
+            attempts: entry.attempts,
+            maxAttempts: config.whatsapp.maxAttempts,
+            error: entry.last_error,
+        });
+
+        return false;
+    } finally {
+        whatsappInFlight.delete(file);
+    }
+}
+
+/**
+ * Queue the WhatsApp message for a lead, or explain why it is skipped.
+ */
+function enqueueWhatsapp(lead) {
+    if (!config.whatsapp.enabled) return null;
+
+    const reason = skipReason(lead);
+
+    if (reason) {
+        log.info('WhatsApp skipped for this lead', { leadId: lead.leadId || null, reason });
+        return null;
+    }
+
+    const pending = recipientsFor(lead);
+
+    if (!pending.length) {
+        log.info('WhatsApp skipped for this lead', { leadId: lead.leadId || null, reason: 'no recipients' });
+        return null;
+    }
+
+    const queued = enqueue('whatsapp', lead, { pending });
+
+    if (queued) {
+        log.info('WhatsApp message queued', { leadId: lead.leadId || null, pending });
+    }
+
+    return queued;
+}
+
 async function handleLead(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const contentType = req.headers['content-type'] || '';
@@ -214,15 +383,26 @@ async function handleLead(req, res) {
     }
 
     // Safe on disk BEFORE we answer, so a crash cannot lose the lead.
-    const queued = enqueue(lead);
-    appendLead(lead, { outbox: queued ? basename(queued.file) : null });
+    const queuedEmail = enqueue('email', lead);
+    const queuedWhatsapp = enqueueWhatsapp(lead);
+
+    appendLead(lead, {
+        outbox: queuedEmail ? basename(queuedEmail.file) : null,
+        whatsapp_outbox: queuedWhatsapp ? basename(queuedWhatsapp.file) : null,
+    });
 
     // Answer JustDial immediately - it must never wait on our mail server.
     received(res);
 
-    if (queued) {
-        deliverQueued(queued.file, queued.data).catch((error) => {
-            log.error('Background delivery crashed', { error: error.message });
+    if (queuedEmail) {
+        deliverQueued(queuedEmail.file, queuedEmail.data).catch((error) => {
+            log.error('Background email delivery crashed', { error: error.message });
+        });
+    }
+
+    if (queuedWhatsapp) {
+        deliverWhatsappQueued(queuedWhatsapp.file, queuedWhatsapp.data).catch((error) => {
+            log.error('Background WhatsApp delivery crashed', { error: error.message });
         });
     }
 
@@ -231,8 +411,12 @@ async function handleLead(req, res) {
 
 function handleHealth(res) {
     const problems = validateConfig();
-    const queued = listQueued();
-    const waiting = queued.filter((item) => !item.data.delivered).length;
+
+    const emailQueue = listQueued('email');
+    const emailWaiting = emailQueue.filter((item) => !item.data.delivered && !item.data.gave_up).length;
+
+    const whatsappQueue = config.whatsapp.enabled ? listQueued('whatsapp') : [];
+    const whatsappWaiting = whatsappQueue.filter((item) => !item.data.delivered && !item.data.gave_up).length;
 
     reply(res, 200, JSON.stringify({
         service: 'justdial-mailer',
@@ -247,10 +431,16 @@ function handleHealth(res) {
             smtpHost: config.smtp.host,
             smtpPort: config.smtp.port,
         },
+        whatsapp: whatsappStatus(),
         outbox: {
-            waiting,
-            total: queued.length,
+            waiting: emailWaiting,
+            total: emailQueue.length,
             inFlight: inFlight.size,
+        },
+        whatsappOutbox: {
+            waiting: whatsappWaiting,
+            total: whatsappQueue.length,
+            inFlight: whatsappInFlight.size,
         },
         problems,
         time: new Date().toISOString(),
@@ -269,6 +459,10 @@ async function handle(req, res) {
         return handleCopy(res, url);
     }
 
+    if (req.method === 'GET' && config.pathSecret && path === `/whatsapp/qr/${config.pathSecret}`) {
+        return handleQr(res);
+    }
+
     if (path === leadPath && (req.method === 'GET' || req.method === 'POST')) {
         return handleLead(req, res);
     }
@@ -281,25 +475,38 @@ async function handle(req, res) {
 }
 
 /**
- * Try every outbox entry that has not been delivered yet.
+ * Try every queued entry that has not been delivered yet.
  */
 async function retryOutbox() {
-    const items = listQueued();
-    if (!items.length) return;
+    await retryQueue('email', deliverQueued);
 
-    const pending = items.filter(({ data }) => !data.delivered && !data.gave_up);
+    if (config.whatsapp.enabled) {
+        await retryQueue('whatsapp', deliverWhatsappQueued);
+    }
+}
+
+async function retryQueue(kind, deliver) {
+    const pending = listQueued(kind).filter(({ data }) => !data.delivered && !data.gave_up);
 
     if (!pending.length) return;
 
-    log.info(`Retrying ${pending.length} lead email(s) from the outbox`);
+    log.info(`Retrying ${pending.length} queued ${kind} message(s)`);
 
     for (const { file, data } of pending) {
-        await deliverQueued(file, data);
+        await deliver(file, data);
     }
 }
 
 async function main() {
     ensureDirs();
+
+    const whatsappLine = config.whatsapp.enabled
+        ? [
+            config.whatsapp.provider,
+            config.whatsapp.sendToLead ? 'lead number' : null,
+            config.whatsapp.teamNumbers.length ? `${config.whatsapp.teamNumbers.length} team number(s)` : null,
+        ].filter(Boolean).join(' + ')
+        : 'off';
 
     console.log('');
     console.log('  JustDial Mailer');
@@ -307,7 +514,8 @@ async function main() {
     console.log(`  Lead endpoint : ${leadUrl()}`);
     console.log(`  Health check  : http://localhost:${config.port}${config.healthPath}`);
     console.log(`  Emails go to  : ${config.mail.to.join(', ') || '(none configured!)'}`);
-    console.log(`  Mode          : ${config.dryRun ? 'DRY RUN (no email is sent)' : 'LIVE'}`);
+    console.log(`  WhatsApp      : ${whatsappLine}`);
+    console.log(`  Mode          : ${config.dryRun ? 'DRY RUN (nothing is actually sent)' : 'LIVE'}`);
     console.log('');
 
     const problems = validateConfig();
@@ -320,7 +528,7 @@ async function main() {
     if (smtp.ok) log.info(smtp.message);
     else log.error('SMTP check failed', { error: smtp.message });
 
-    const queuedAtBoot = countQueued();
+    const queuedAtBoot = countQueued('email') + (config.whatsapp.enabled ? countQueued('whatsapp') : 0);
 
     if (config.retryIntervalSeconds > 0) {
         setInterval(() => {
@@ -344,6 +552,16 @@ async function main() {
     server.listen(config.port, config.host, () => {
         log.info('Listening', { host: config.host, port: config.port });
 
+        // Bring WhatsApp up in the background - it must never delay the endpoint.
+        if (config.whatsapp.enabled) {
+            startWhatsapp().then(() => {
+                const status = whatsappStatus();
+
+                if (status.ready) log.info('WhatsApp is ready to send');
+                else log.warn('WhatsApp is not ready yet - see the error above', { status: status.status });
+            });
+        }
+
         // Recover anything the mail server refused while we were down.
         if (queuedAtBoot > 0) {
             setTimeout(() => {
@@ -353,9 +571,17 @@ async function main() {
     });
 
     const shutdown = (signal) => {
-        log.info(`Received ${signal} - shutting down`, { inFlight: inFlight.size });
-        server.close(() => process.exit(0));
-        setTimeout(() => process.exit(0), 8000).unref();
+        log.info(`Received ${signal} - shutting down`, {
+            inFlight: inFlight.size,
+            whatsappInFlight: whatsappInFlight.size,
+        });
+
+        Promise.race([stopWhatsapp(), sleep(5000)])
+            .catch(() => {})
+            .finally(() => {
+                server.close(() => process.exit(0));
+                setTimeout(() => process.exit(0), 8000).unref();
+            });
     };
 
     process.on('SIGINT', () => shutdown('SIGINT'));

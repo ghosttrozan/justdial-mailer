@@ -1,4 +1,5 @@
 import busboy from 'busboy';
+import { config } from './config.js';
 
 /**
  * The fields the JustDial lead spec sends. Display order + human labels.
@@ -202,4 +203,61 @@ export function normalize(data) {
  */
 export function isUsable(lead) {
     return Boolean(lead.leadId || lead.name || lead.mobile || lead.phone);
+}
+
+/**
+ * The values available to any {{placeholder}} template (email subject,
+ * WhatsApp message, anything added later).
+ */
+export function templateVars(lead, extra = {}) {
+    return {
+        leadid: lead.leadId || '',
+        name: lead.name || lead.fullName || '',
+        fullname: lead.fullName || '',
+        displayname: lead.fullName || lead.name || '',
+        prefix: lead.prefix || '',
+        mobile: lead.mobile || lead.displayPhone || '',
+        phone: lead.phone || '',
+        email: lead.email || '',
+        company: lead.company || '',
+        category: lead.category || '',
+        area: lead.area || '',
+        city: lead.city || '',
+        address: lead.address || '',
+        pincode: lead.pincode || '',
+        leadtype: lead.leadType || '',
+        date: lead.date || '',
+        time: lead.time || '',
+        business: config.businessName || '',
+
+        // `extra` wins, so a caller can keep a template's old meaning.
+        ...extra,
+    };
+}
+
+/**
+ * Fill {{placeholders}} in a template. Unknown keys become an empty string.
+ */
+export function fillTemplate(template, lead, extra = {}) {
+    const vars = templateVars(lead, extra);
+
+    return String(template ?? '').replace(/\{\{\s*(\w+)\s*\}\}/gi, (_match, key) => {
+        const value = vars[String(key).toLowerCase()];
+        return value === undefined || value === null ? '' : String(value);
+    });
+}
+
+/**
+ * Small clean-up after filling a template: drop empty brackets left behind by
+ * a missing value and squeeze the blank lines they leave.
+ */
+export function tidyTemplate(text) {
+    return String(text ?? '')
+        .replace(/\(\s*\)/g, '')
+        .replace(/\[\s*\]/g, '')
+        // "enquiry aayi hai ." -> "enquiry aayi hai."
+        .replace(/[ \t]+([.,!?;:])/g, '$1')
+        .replace(/[ \t]+$/gm, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
 }

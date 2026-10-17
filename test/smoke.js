@@ -149,7 +149,12 @@ await check('copy page escapes injected html', async () => {
 await check('health endpoint returns JSON', async () => {
     const res = await fetch(`${base}${config.healthPath}`);
     const json = await res.json();
-    return json.status ? 'RECEIVED' : 'bad payload';
+
+    if (!json.status) return 'bad payload';
+    if (!json.whatsapp || typeof json.whatsapp.enabled !== 'boolean') return 'the whatsapp block is missing';
+    if (!json.whatsappOutbox) return 'the whatsapp outbox block is missing';
+
+    return 'RECEIVED';
 });
 
 await check('unknown path is 404', async () => {

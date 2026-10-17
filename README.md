@@ -14,10 +14,11 @@ JustDial  ──GET/POST──►  /justdial/lead  ──►  📧  your inbox
 - Accepts **GET, POST, JSON, form-urlencoded, form-data and query strings**
 - Every lead is saved to disk **before** the reply, so nothing is ever lost
 - If the mail server is down the lead waits in an **outbox** and is retried automatically
+- Optional **WhatsApp message to the lead's own number**, with its own outbox
 - Clean lead email with **Call / WhatsApp / Maps** buttons
 - **Copy button on every field**, plus a **Copy all** button
 - Optional duplicate window (JustDial retries on timeout)
-- Zero frameworks — just Node's `http`, `nodemailer` and `busboy`
+- No framework in the core — just Node's `http`, `nodemailer` and `busboy`
 
 ---
 
@@ -273,13 +274,131 @@ On startup the service immediately retries anything left in the outbox.
 | `COPY_PATH` | `/copy` | Path of the copy-to-clipboard page |
 | `DEFAULT_COUNTRY_CODE` | `91` | Prefixed to bare 10 digit numbers for Call / WhatsApp |
 | `WHATSAPP_GREETING` | see `.env.example` | Pre-filled WhatsApp text (`{{name}}` allowed) |
+| `WHATSAPP_ENABLED` | `false` | Also send the lead to WhatsApp |
+| `WHATSAPP_PROVIDER` | `openwa` | `openwa` (in process) or `webhook` |
+| `WHATSAPP_WEBHOOK_URL` | *(empty)* | Gateway URL for the `webhook` provider |
+| `WHATSAPP_SESSION_DIR` | `.wa-session` | Where the WhatsApp login is kept |
+| `WHATSAPP_SEND_TO_LEAD` | `true` | Message the lead's own number |
+| `WHATSAPP_TEAM_NUMBERS` | *(empty)* | Extra numbers to copy in |
+| `WHATSAPP_BLOCKLIST` | *(empty)* | Numbers to never message |
+| `WHATSAPP_RESPECT_DNC` | `true` | Honour JustDial's DNC flag |
+| `WHATSAPP_MESSAGE` | built-in | The message template |
+| `BUSINESS_NAME` | *(empty)* | Fills `{{business}}` |
 
 `MAIL_SUBJECT` placeholders: `{{name}}`, `{{mobile}}`, `{{phone}}`, `{{company}}`,
 `{{city}}`, `{{category}}`, `{{area}}`, `{{leadid}}`.
 
 ---
 
-## 9. The buttons in the lead email
+## 9. Sending the lead to WhatsApp
+
+With `WHATSAPP_ENABLED=true` every new lead is also sent as a WhatsApp message
+to **the customer's own number** - the one JustDial just gave you.
+`WHATSAPP_TEAM_NUMBERS` copies your sales team in as well.
+
+It is completely independent of email: if WhatsApp is down the email still goes
+out, and the other way round. A failed WhatsApp message waits in
+`logs/outbox-whatsapp/` and is retried - and a retry **never re-messages somebody
+who already received it**.
+
+### Pick a provider
+
+| `WHATSAPP_PROVIDER` | What it does |
+|---|---|
+| `openwa` *(default)* | Runs the [open-wa](https://github.com/open-wa/wa-automate-nodejs) library inside this service. You link it to your own WhatsApp once by scanning a QR code. |
+| `webhook` | POSTs the message as JSON to any WhatsApp gateway you already have - [WAHA](https://waha.devlike.pro/), n8n, Make, your own bot. Nothing extra to install. |
+
+### Provider `openwa` - the one-time QR scan
+
+```bash
+npm install @open-wa/wa-automate   # already listed as an optional dependency
+```
+
+Set `WHATSAPP_ENABLED=true` and start the service. It prints a QR code in the
+terminal and writes one to **`logs/whatsapp-qr.png`**. On your phone:
+WhatsApp → **Settings → Linked devices → Link a device**, then scan it.
+
+If you cannot see the server's screen, open the QR in a browser instead:
+
+```
+https://your-domain.com/whatsapp/qr/YOUR_PATH_SECRET
+```
+
+> That URL is guarded by `PATH_SECRET` on purpose - anybody who could read it
+> could link their own WhatsApp to your session.
+
+The login is remembered in `WHATSAPP_SESSION_DIR` (`.wa-session/`), so you scan
+once. Keep that folder private, back it up, and delete it to unlink.
+
+**It also needs:**
+
+- A Chrome or Chromium on the machine - set `WHATSAPP_CHROME_PATH` if it lives
+  somewhere unusual
+- On Linux, the `zstd` binary: `apt-get install -y zstd` (open-wa uses it)
+
+If either is missing, the service says exactly what is wrong and **keeps
+working** - leads still go out by email, and the WhatsApp message stays queued.
+
+### Provider `webhook`
+
+Point `WHATSAPP_WEBHOOK_URL` at your gateway. It receives:
+
+```http
+POST /your-endpoint
+Authorization: Bearer <WHATSAPP_WEBHOOK_TOKEN>
+Content-Type: application/json
+
+{
+  "chatId": "919876543210@c.us",
+  "phone": "919876543210",
+  "message": "Namaste Ramesh Gupta ji, ...",
+  "text": "Namaste Ramesh Gupta ji, ..."
+}
+```
+
+Any non-2xx answer counts as a failure, so the message is queued and retried.
+
+### The message
+
+`WHATSAPP_MESSAGE` is a template, and every placeholder is filled from the lead:
+
+| Placeholder | Becomes |
+|---|---|
+| `{{name}}` | the person's name, without the prefix |
+| `{{fullname}}` | with the prefix - `Mr Ramesh Gupta` |
+| `{{mobile}}` `{{phone}}` | the numbers JustDial sent |
+| `{{category}}` `{{company}}` | what the enquiry is about |
+| `{{city}}` `{{area}}` `{{address}}` `{{pincode}}` | where it is |
+| `{{leadid}}` `{{leadtype}}` `{{date}}` `{{time}}` | JustDial's own metadata |
+| `{{business}}` | `BUSINESS_NAME` from your `.env` |
+
+A placeholder with no value disappears, together with the brackets around it, so
+`enquiry ki thi ({{category}}).` still reads properly when the category is empty.
+
+### Test it
+
+```bash
+npm run test:whatsapp                  # offline: template, DNC, webhook. Sends nothing.
+npm run send:whatsapp -- 9876543210    # sends ONE real message, through the live provider
+```
+
+### Stay out of trouble
+
+WhatsApp dislikes automation, and a number that behaves like a bulk sender gets
+banned. This is built for low volume - a JustDial lead now and then - and does
+this to stay safe:
+
+- `WHATSAPP_RESPECT_DNC=true` skips anything JustDial flagged as DNC
+- `WHATSAPP_BLOCKLIST` leaves specific numbers alone
+- a random 5-15 second pause between messages to different numbers
+- at most one message per lead, so a retry never duplicates
+- `DEDUPE_WINDOW_SECONDS` stops a second message when JustDial retries a call
+
+Keep the volume low and only message people who actually enquired.
+
+---
+
+## 10. The buttons in the lead email
 
 Mail clients strip JavaScript, so a copy button **cannot** copy on its own.
 Instead each copy button is an ordinary link to a tiny page on your own
@@ -318,7 +437,7 @@ The other buttons need no configuration:
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 **`RECEIVED` but no email**
 Run `npm run test:smtp`. Usually a normal Gmail password was used instead of an
@@ -346,7 +465,7 @@ JustDial, and that the URL is not missing it.
 
 ---
 
-## 11. Local smoke test without Gmail
+## 12. Local smoke test without Gmail
 
 ```ini
 DRY_RUN=true

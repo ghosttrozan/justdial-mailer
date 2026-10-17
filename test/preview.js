@@ -11,6 +11,7 @@ import path from 'node:path';
 import { config } from '../src/config.js';
 import { normalize } from '../src/lead.js';
 import { buildHtml, buildText } from '../src/mailer.js';
+import { renderWhatsappMessage } from '../src/whatsapp.js';
 import { ensureDirs } from '../src/store.js';
 
 const now = new Date();
@@ -46,13 +47,17 @@ ensureDirs();
 
 const htmlFile = path.join(config.logs.dir, 'preview.html');
 const textFile = path.join(config.logs.dir, 'preview.txt');
+const whatsappFile = path.join(config.logs.dir, 'preview-whatsapp.txt');
 
 fs.writeFileSync(htmlFile, buildHtml(lead));
 fs.writeFileSync(textFile, buildText(lead));
+fs.writeFileSync(whatsappFile, renderWhatsappMessage(lead));
 
-console.log('Email preview written to:');
+console.log('Previews written to:');
 console.log(`  ${htmlFile}`);
 console.log(`  ${textFile}`);
+console.log(`  ${whatsappFile}`);
 console.log('');
 console.log(`Base URL used for copy links : ${lead.baseUrl}`);
+console.log(`WhatsApp message             : ${config.whatsapp.enabled ? `${config.whatsapp.provider} (enabled)` : 'disabled (preview only)'}`);
 console.log(`Dry run                      : ${config.dryRun}`);

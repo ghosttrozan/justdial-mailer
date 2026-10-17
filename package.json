@@ -14,11 +14,16 @@
     "test:lead": "node test/send-sample.js",
     "test:smoke": "node test/smoke.js",
     "test:smtp": "node test/check-smtp.js",
+    "test:whatsapp": "node test/whatsapp.js",
+    "send:whatsapp": "node test/send-whatsapp.js",
     "preview": "node test/preview.js"
   },
   "dependencies": {
     "busboy": "^1.6.0",
     "dotenv": "^16.4.5",
     "nodemailer": "^6.9.14"
+  },
+  "optionalDependencies": {
+    "@open-wa/wa-automate": "^5.6.6"
   }
 }
