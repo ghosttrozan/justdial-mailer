@@ -4,5 +4,9 @@ logs/
 *.log
 .DS_Store
 
-# WhatsApp (open-wa) session - whoever holds this holds the WhatsApp login.
+# WhatsApp session - whoever holds this holds the WhatsApp login.
+# wwjs keeps a Chrome profile here, openwa an encrypted .data.json.
 .wa-session/
+
+# whatsapp-web.js caches the WhatsApp Web build it runs.
+.wwebjs_cache/

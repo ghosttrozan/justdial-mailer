@@ -7,12 +7,16 @@ import { log } from './logger.js';
 import { renderQrHtml } from './qrpage.js';
 
 /**
- * Sends the lead to the customer's own WhatsApp number.
+ * Sends the lead to WhatsApp.
  *
- * Two providers, chosen with WHATSAPP_PROVIDER:
+ * Three providers, chosen with WHATSAPP_PROVIDER:
  *
- *   openwa   the @open-wa/wa-automate library runs in this process, linked to
- *            your own WhatsApp once by scanning a QR code
+ *   wwjs     the whatsapp-web.js library runs in this process. It keeps a real
+ *            Chrome profile under WHATSAPP_SESSION_DIR, so the link survives a
+ *            restart - scan the QR once and never again. (default)
+ *   openwa   the @open-wa/wa-automate library runs in this process. Its v5
+ *            session file is written from an in-page patch that is often
+ *            missing, so it tends to ask for a QR code again after a restart.
  *   webhook  the message is POSTed as JSON to any WhatsApp HTTP gateway
  *            (WAHA, n8n, Make, your own bot ...)
  *
@@ -167,9 +171,7 @@ export async function sendWhatsappText(number, text) {
     }
 
     try {
-        const result = config.whatsapp.provider === 'webhook'
-            ? await sendViaWebhook(number, text)
-            : await sendViaOpenWa(number, text);
+        const result = await sendViaProvider(number, text);
 
         state.sent += 1;
         state.lastSendAt = new Date().toISOString();
@@ -180,6 +182,13 @@ export async function sendWhatsappText(number, text) {
         state.lastError = String(error?.message || error);
         throw error;
     }
+}
+
+function sendViaProvider(number, text) {
+    if (config.whatsapp.provider === 'webhook') return sendViaWebhook(number, text);
+    if (config.whatsapp.provider === 'wwjs') return sendViaWwjs(number, text);
+
+    return sendViaOpenWa(number, text);
 }
 
 /** Convenience: render the message for a lead and send it to one number. */
@@ -229,6 +238,194 @@ async function sendViaOpenWa(number, text) {
 
     throw new Error('the WhatsApp client has no sendText() method - is the open-wa version supported?');
 }
+
+async function sendViaWwjs(number, text) {
+    if (!state.client) await waitForClient();
+
+    if (!state.client) {
+        throw new Error(state.lastError || 'the WhatsApp client is not connected yet');
+    }
+
+    const chatId = `${number}@c.us`;
+
+    if (typeof state.client.getNumberId === 'function') {
+        const registered = await state.client.getNumberId(number).catch(() => null);
+
+        if (!registered) throw new Error(`${number} is not on WhatsApp`);
+    }
+
+    const sent = await state.client.sendMessage(chatId, text);
+
+    return { to: number, via: 'wwjs', chatId, id: sent?.id?._serialized ?? null };
+}
+
+/* ------------------------------------------------------------------ *
+ * The whatsapp-web.js provider
+ * ------------------------------------------------------------------ */
+
+let wwjsModule = null;
+
+/**
+ * Load whatsapp-web.js lazily, and turn any failure into a message that says
+ * exactly what to do about it.
+ */
+async function loadWwjs() {
+    if (wwjsModule) return wwjsModule;
+
+    try {
+        const loaded = await import('whatsapp-web.js');
+        const api = loaded?.default ?? loaded;
+
+        if (typeof api?.Client !== 'function' || typeof api?.LocalAuth !== 'function') {
+            throw new Error('the module loaded but does not export Client / LocalAuth');
+        }
+
+        wwjsModule = api;
+        return api;
+    } catch (error) {
+        throw new Error(
+            'The whatsapp-web.js library could not be loaded (' + (error?.message || error) + '). '
+            + 'Fix it with: npm install whatsapp-web.js',
+        );
+    }
+}
+
+/** The Chrome to drive, when WHATSAPP_CHROME_PATH is not set. */
+function findChrome() {
+    const candidates = process.platform === 'win32'
+        ? [
+            path.join(process.env['PROGRAMFILES'] || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            path.join(process.env['PROGRAMFILES'] || 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        ]
+        : process.platform === 'darwin'
+            ? ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']
+            : [
+                '/usr/bin/google-chrome',
+                '/usr/bin/google-chrome-stable',
+                '/usr/bin/chromium',
+                '/usr/bin/chromium-browser',
+                '/snap/bin/chromium',
+            ];
+
+    for (const candidate of candidates) {
+        try {
+            if (candidate && fs.existsSync(candidate)) return candidate;
+        } catch {
+            // keep looking
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Create the whatsapp-web.js client.
+ *
+ * LocalAuth is the point of this provider: it stores a full Chrome profile in
+ * WHATSAPP_SESSION_DIR/session-<sessionId>/, so the link is still there after a
+ * restart - no second scan.
+ */
+async function createWwjsClient() {
+    const { Client, LocalAuth } = await loadWwjs();
+
+    const puppeteerOptions = {
+        headless: config.whatsapp.headless,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    };
+
+    const executablePath = config.whatsapp.chromePath || findChrome();
+
+    if (executablePath) puppeteerOptions.executablePath = executablePath;
+    else log.warn('No Chrome found - set WHATSAPP_CHROME_PATH if it lives somewhere unusual');
+
+    log.info('Starting the WhatsApp client - the first run shows a QR code to scan', {
+        provider: 'wwjs',
+        sessionId: config.whatsapp.sessionId,
+        sessionDir: config.whatsapp.sessionDir,
+        headless: config.whatsapp.headless,
+        chrome: executablePath || '(puppeteer default)',
+    });
+
+    const client = new Client({
+        authStrategy: new LocalAuth({
+            clientId: config.whatsapp.sessionId,
+            dataPath: config.whatsapp.sessionDir,
+        }),
+        puppeteer: puppeteerOptions,
+        // 0 = keep offering a fresh code instead of giving up on the scan.
+        qrMaxRetries: 0,
+        authTimeoutMs: 0,
+        takeoverOnConflict: true,
+        takeoverTimeoutMs: 0,
+    });
+
+    client.on('qr', (qr) => {
+        if (!qr) return;
+
+        state.status = 'qr';
+        clearQr();
+        saveQr({ qr });
+    });
+
+    client.on('authenticated', () => {
+        log.info('WhatsApp accepted the QR code - finishing the link');
+    });
+
+    client.on('auth_failure', (message) => {
+        state.lastError = `WhatsApp refused the link: ${message}`;
+        log.error('WhatsApp refused the link', { error: state.lastError });
+    });
+
+    client.on('disconnected', (reason) => {
+        state.ready = false;
+        state.client = null;
+        state.lastError = `WhatsApp disconnected: ${reason}`;
+
+        log.warn('WhatsApp disconnected', { reason });
+        scheduleStartRetry();
+    });
+
+    // Resolves once the page is up - NOT once the number is linked, so the
+    // 'ready' event below is what actually means "linked".
+    await client.initialize();
+    await waitForWwjsReady(client);
+
+    return client;
+}
+
+/**
+ * Resolve once WhatsApp Web confirms the number is linked.
+ *
+ * Client.initialize() resolves as soon as the WhatsApp Web page loads - before
+ * the QR is even scanned - so treating that as "linked" would report a session
+ * that does not exist yet.
+ */
+function waitForWwjsReady(client) {
+    if (client.info) return Promise.resolve();
+
+    return new Promise((resolve) => {
+        let timer;
+
+        const finish = () => {
+            if (timer) clearInterval(timer);
+            client.off('ready', finish);
+            resolve();
+        };
+
+        client.on('ready', finish);
+
+        // Belt and braces: some builds do not re-emit 'ready'.
+        timer = setInterval(() => {
+            if (client.info) finish();
+        }, 2000);
+
+        if (typeof timer.unref === 'function') timer.unref();
+    });
+}
+
+
 
 /* ------------------------------------------------------------------ *
  * The open-wa provider
@@ -482,7 +679,9 @@ export function startWhatsapp() {
             return null;
         }
 
-        const client = await createOpenWaClient();
+        const client = config.whatsapp.provider === 'wwjs'
+            ? await createWwjsClient()
+            : await createOpenWaClient();
 
         state.client = client;
         state.ready = true;
