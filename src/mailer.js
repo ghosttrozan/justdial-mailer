@@ -346,7 +346,10 @@ export async function sendLead(lead) {
     }
 
     if (config.resendApiKey) {
-        const fromAddress = config.mail.from || 'onboarding@resend.dev';
+        let fromAddress = config.mail.from || 'onboarding@resend.dev';
+        if (fromAddress.toLowerCase().endsWith('@gmail.com') || fromAddress.toLowerCase().endsWith('@googlemail.com')) {
+            fromAddress = 'onboarding@resend.dev';
+        }
         const from = `"${config.mail.fromName}" <${fromAddress}>`;
 
         return sendViaResend({
