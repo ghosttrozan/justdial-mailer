@@ -4,6 +4,7 @@ import { config } from './config.js';
 import { fillTemplate, tidyTemplate } from './lead.js';
 import { normalisePhone } from './links.js';
 import { log } from './logger.js';
+import { renderQrHtml } from './qrpage.js';
 
 /**
  * Sends the lead to the customer's own WhatsApp number.
@@ -29,7 +30,10 @@ const state = {
     connectedAt: null,
     lastError: null,
     qrFile: null,
+    qrHtmlFile: null,
     qrSavedAt: null,
+    startAttempts: 0,
+    retryTimer: null,
     sent: 0,
     failed: 0,
     lastSendAt: null,
@@ -40,9 +44,32 @@ const state = {
  * ------------------------------------------------------------------ */
 
 /**
- * The WhatsApp text for a lead, with every {{placeholder}} filled in.
+ * A lead rarely fills every field, so a "Label:" line with nothing after it is
+ * just noise. Drop the whole line rather than leaving a bare label.
  */
-export function renderWhatsappMessage(lead) {
+function dropEmptyLabels(text) {
+    return String(text ?? '')
+        .split('\n')
+        .filter((line) => !/^\s*[*_~]*[A-Za-z0-9 ()/#&.'-]+:\s*[*_~]*\s*$/.test(line))
+        .join('\n');
+}
+
+/**
+ * The lead card sent to your own numbers - the enquiry details.
+ */
+export function renderTeamMessage(lead) {
+    return tidyTemplate(dropEmptyLabels(fillTemplate(config.whatsapp.teamMessage, lead)));
+}
+
+/**
+ * The WhatsApp text for a lead, with every {{placeholder}} filled in.
+ *
+ * `audience` decides which template wins: your team gets the lead card, the
+ * lead themselves gets the customer greeting.
+ */
+export function renderWhatsappMessage(lead, audience = 'lead') {
+    if (audience === 'team') return renderTeamMessage(lead);
+
     return tidyTemplate(fillTemplate(config.whatsapp.message, lead));
 }
 
@@ -72,41 +99,53 @@ export function isBlocked(number) {
 export function skipReason(lead) {
     if (!config.whatsapp.enabled) return 'WhatsApp sending is turned off';
 
-    const number = normalisePhone(lead.mobile || lead.phone);
-    if (!number || number.length < 10) return 'the lead has no usable mobile number';
-
-    if (isBlocked(number)) return 'the number is on WHATSAPP_BLOCKLIST';
-
     if (!config.whatsapp.sendToLead && !config.whatsapp.teamNumbers.length) {
         return 'nothing is configured to receive the message';
     }
 
-    if (config.whatsapp.respectDnc) {
-        // JustDial flags numbers that must not be contacted - respect them.
-        if (isFlagOn(lead.raw?.dncmobile)) return 'the JustDial DNC flag is set on the mobile number';
-        if (isFlagOn(lead.raw?.dncphone)) return 'the JustDial DNC flag is set on the phone number';
+    const number = normalisePhone(lead.mobile || lead.phone);
+
+    if (number && isBlocked(number)) return 'the number is on WHATSAPP_BLOCKLIST';
+
+    if (config.whatsapp.sendToLead) {
+        if (!number || number.length < 10) return 'the lead has no usable mobile number';
+
+        if (config.whatsapp.respectDnc) {
+            // JustDial flags numbers that must not be contacted - respect them.
+            if (isFlagOn(lead.raw?.dncmobile)) return 'the JustDial DNC flag is set on the mobile number';
+            if (isFlagOn(lead.raw?.dncphone)) return 'the JustDial DNC flag is set on the phone number';
+        }
     }
 
     return null;
 }
 
 /**
- * The numbers this lead should be sent to: the customer, plus any team numbers.
+ * The numbers this lead should be sent to, each with the message it should get.
+ *
+ * A number that is both the lead's own and one of your team numbers gets the
+ * lead card: the team asked to see the enquiry, so that wins.
+ *
+ * @returns {Array<{number: string, audience: 'lead'|'team'}>}
  */
 export function recipientsFor(lead) {
-    const numbers = [];
+    const plan = new Map();
 
     if (config.whatsapp.sendToLead) {
         const leadNumber = normalisePhone(lead.mobile || lead.phone);
-        if (leadNumber && leadNumber.length >= 10 && !isBlocked(leadNumber)) numbers.push(leadNumber);
+        if (leadNumber && leadNumber.length >= 10 && !isBlocked(leadNumber)) {
+            plan.set(leadNumber, 'lead');
+        }
     }
 
     for (const entry of config.whatsapp.teamNumbers) {
         const number = normalisePhone(entry);
-        if (number && !isBlocked(number)) numbers.push(number);
+        if (!number || isBlocked(number)) continue;
+
+        plan.set(number, 'team');
     }
 
-    return [...new Set(numbers)];
+    return [...plan].map(([number, audience]) => ({ number, audience }));
 }
 
 /* ------------------------------------------------------------------ *
@@ -144,8 +183,8 @@ export async function sendWhatsappText(number, text) {
 }
 
 /** Convenience: render the message for a lead and send it to one number. */
-export async function sendLeadWhatsapp(lead, number) {
-    return sendWhatsappText(number, renderWhatsappMessage(lead));
+export async function sendLeadWhatsapp(lead, number, audience = 'lead') {
+    return sendWhatsappText(number, renderWhatsappMessage(lead, audience));
 }
 
 async function sendViaWebhook(number, text) {
@@ -197,12 +236,38 @@ async function sendViaOpenWa(number, text) {
 
 let openwaModule = null;
 
+async function patchWindowsDirectoryFsync() {
+    if (process.platform !== 'win32') return;
+    try {
+        const fsPromises = await import('node:fs/promises');
+        const dummy = await fsPromises.open(process.cwd(), 0);
+        const proto = Object.getPrototypeOf(dummy);
+        if (proto && typeof proto.sync === 'function' && !proto._winFsSyncPatched) {
+            const originalSync = proto.sync;
+            proto.sync = function (...args) {
+                return originalSync.apply(this, args).catch((err) => {
+                    if (err && (err.code === 'EPERM' || err.code === 'EBADF' || err.code === 'EISDIR')) {
+                        return;
+                    }
+                    throw err;
+                });
+            };
+            proto._winFsSyncPatched = true;
+        }
+        await dummy.close();
+    } catch {
+        // Ignored
+    }
+}
+
 /**
  * Load @open-wa/wa-automate lazily, and turn any failure into a message that
  * says exactly what to do about it.
  */
 async function loadOpenWa() {
     if (openwaModule) return openwaModule;
+
+    await patchWindowsDirectoryFsync();
 
     try {
         const loaded = await import('@open-wa/wa-automate');
@@ -267,12 +332,61 @@ function saveQr(payload) {
         else fs.writeFileSync(file, qr);
 
         state.qrFile = file;
+        state.qrHtmlFile = base64 ? null : saveQrPage(qr);
         state.qrSavedAt = new Date().toISOString();
         state.status = 'qr';
 
-        log.warn('WhatsApp is not linked yet - scan the QR to connect', { qr: file });
+        log.warn('WhatsApp is not linked yet - scan the QR to connect', {
+            qr: file,
+            scanUrl: state.qrHtmlFile && config.pathSecret
+                ? `/whatsapp/qr/${config.pathSecret}`
+                : null,
+        });
     } catch (error) {
         log.error('Could not save the WhatsApp QR code', { error: error.message });
+    }
+}
+
+/**
+ * A page around the linking code, so it can be opened in a browser and scanned
+ * off the screen. The raw payload alone is useless to a human, and WhatsApp
+ * rotates it every ~20 seconds, so the page reloads itself.
+ *
+ * @returns {string|null} the written path, or null when we could not render it.
+ */
+function saveQrPage(payload) {
+    try {
+        const html = renderQrHtml(payload);
+        if (!html) return null;
+
+        const file = path.join(config.logs.dir, 'whatsapp-qr.html');
+        fs.writeFileSync(file, html);
+
+        return file;
+    } catch (error) {
+        log.warn('Could not render the WhatsApp QR page', { error: error.message });
+
+        return null;
+    }
+}
+
+/**
+ * Drop the expiring code from disk and from the status.
+ *
+ * A dead code left on screen is worse than no code: the scan fails silently and
+ * the page looks broken, which is exactly the confusion this avoids.
+ */
+function clearQr() {
+    state.qrFile = null;
+    state.qrHtmlFile = null;
+
+    for (const name of ['whatsapp-qr.txt', 'whatsapp-qr.html', 'whatsapp-qr.png']) {
+        try {
+            const file = path.join(config.logs.dir, name);
+            if (fs.existsSync(file)) fs.unlinkSync(file);
+        } catch {
+            // Nothing to clean up is the normal case.
+        }
     }
 }
 
@@ -347,8 +461,14 @@ export function startWhatsapp() {
 
     if (state.readyPromise) return state.readyPromise;
 
+    if (state.retryTimer) {
+        clearTimeout(state.retryTimer);
+        state.retryTimer = null;
+    }
+
     state.status = 'starting';
     state.lastError = null;
+    state.startAttempts += 1;
 
     const attempt = (async () => {
         if (config.whatsapp.provider === 'webhook') {
@@ -369,6 +489,8 @@ export function startWhatsapp() {
         state.status = 'ready';
         state.connectedAt = new Date().toISOString();
         state.qrFile = null;
+        state.qrHtmlFile = null;
+        state.startAttempts = 0;
 
         log.info('WhatsApp is linked - leads are now messaged automatically', {
             sessionId: config.whatsapp.sessionId,
@@ -383,11 +505,38 @@ export function startWhatsapp() {
 
         log.error('WhatsApp could not start - leads still go out by email', { error: state.lastError });
 
+        clearQr();
+        scheduleStartRetry();
+
         return null;
     });
 
     state.readyPromise = attempt;
     return attempt;
+}
+
+/**
+ * Queue another linking attempt after a failure.
+ *
+ * Without this the QR page dies the moment open-wa stops waiting, so a scan
+ * that arrives a few minutes late hits a dead endpoint and looks like it is
+ * being ignored.
+ */
+function scheduleStartRetry() {
+    if (!config.whatsapp.enabled || state.ready) return;
+    if (state.retryTimer || state.readyPromise) return;
+    if (state.startAttempts > config.whatsapp.startRetries) return;
+
+    state.retryTimer = setTimeout(() => {
+        state.retryTimer = null;
+        startWhatsapp();
+    }, config.whatsapp.startRetrySeconds * 1000);
+
+    log.info('Will offer a fresh WhatsApp QR shortly', {
+        attempt: state.startAttempts,
+        of: config.whatsapp.startRetries,
+        inSeconds: config.whatsapp.startRetrySeconds,
+    });
 }
 
 export async function stopWhatsapp() {
@@ -396,6 +545,13 @@ export async function stopWhatsapp() {
     state.client = null;
     state.ready = false;
     state.readyPromise = null;
+
+    if (state.retryTimer) {
+        clearTimeout(state.retryTimer);
+        state.retryTimer = null;
+    }
+
+    clearQr();
 
     if (!client) return;
 
@@ -417,6 +573,10 @@ export function whatsappStatus() {
         connectedAt: state.connectedAt,
         qrFile: state.qrFile ? path.basename(state.qrFile) : null,
         qrSavedAt: state.qrSavedAt,
+        qrUrl: state.qrHtmlFile && config.pathSecret
+            ? `/whatsapp/qr/${config.pathSecret}`
+            : null,
+        startAttempts: state.startAttempts,
         lastError: state.lastError,
         sent: state.sent,
         failed: state.failed,

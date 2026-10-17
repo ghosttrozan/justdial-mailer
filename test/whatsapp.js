@@ -155,21 +155,79 @@ await check('a missing value leaves no empty brackets', async () => {
 });
 
 await check('the lead number and the team number both get it', async () => {
-    const numbers = recipientsFor(lead());
-    const wanted = ['919876501234', '919000000009'];
+    const plan = recipientsFor(lead());
+    const wanted = [
+        { number: '919876501234', audience: 'lead' },
+        { number: '919000000009', audience: 'team' },
+    ];
 
-    if (JSON.stringify(numbers) !== JSON.stringify(wanted)) {
-        return `got ${JSON.stringify(numbers)}`;
+    if (JSON.stringify(plan) !== JSON.stringify(wanted)) {
+        return `got ${JSON.stringify(plan)}`;
     }
     return true;
 });
 
-await check('the team number alone is used when there is no mobile', async () => {
-    const numbers = recipientsFor(lead({ mobile: '', phone: '' }));
+await check('when sendToLead is false, only team numbers get the lead card', async () => {
+    config.whatsapp.sendToLead = false;
+    try {
+        const plan = recipientsFor(lead());
+        const wanted = [{ number: '919000000009', audience: 'team' }];
 
-    if (JSON.stringify(numbers) !== JSON.stringify(['919000000009'])) {
-        return `got ${JSON.stringify(numbers)}`;
+        if (JSON.stringify(plan) !== JSON.stringify(wanted)) {
+            return `got ${JSON.stringify(plan)}`;
+        }
+
+        // Team should not be blocked even if customer is DNC
+        const dncReason = skipReason(lead({ dncmobile: '1' }));
+        if (dncReason) return `team was unexpectedly blocked by DNC: ${dncReason}`;
+
+        return true;
+    } finally {
+        config.whatsapp.sendToLead = true;
     }
+});
+
+await check('a team number that is also the lead number gets the lead card', async () => {
+    const original = config.whatsapp.teamNumbers;
+    config.whatsapp.teamNumbers = ['9876501234'];
+
+    try {
+        const plan = recipientsFor(lead());
+
+        if (plan.length !== 1) return `expected one recipient, got ${JSON.stringify(plan)}`;
+        if (plan[0].audience !== 'team') return `audience was ${plan[0].audience}`;
+        return true;
+    } finally {
+        config.whatsapp.teamNumbers = original;
+    }
+});
+
+await check('the team number alone is used when there is no mobile', async () => {
+    const plan = recipientsFor(lead({ mobile: '', phone: '' }));
+
+    if (JSON.stringify(plan) !== JSON.stringify([{ number: '919000000009', audience: 'team' }])) {
+        return `got ${JSON.stringify(plan)}`;
+    }
+    return true;
+});
+
+await check('your team gets the lead details, not the customer greeting', async () => {
+    const text = renderWhatsappMessage(lead(), 'team');
+
+    for (const wanted of ['Ramesh Gupta', '9876501234', 'Interior Designer', 'Pune', 'JD-WA-1']) {
+        if (!text.includes(wanted)) return `missing "${wanted}" in:\n${text}`;
+    }
+
+    if (text.includes('Namaste')) return `the team got the customer greeting:\n${text}`;
+    return true;
+});
+
+await check('the lead card drops labels with no value', async () => {
+    const text = renderWhatsappMessage(lead({ email: '', company: '' }), 'team');
+
+    if (/Email:/.test(text)) return `an empty Email label was kept:\n${text}`;
+    if (/Company:/.test(text)) return `an empty Company label was kept:\n${text}`;
+    if (!/Mobile:/.test(text)) return `a filled field was dropped:\n${text}`;
     return true;
 });
 

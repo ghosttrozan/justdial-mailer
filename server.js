@@ -10,7 +10,7 @@
  *   GET / POST  {ENDPOINT_PATH}          <- the lead endpoint
  *   GET         {HEALTH_PATH}            <- health / status
  *   GET         {COPY_PATH}              <- the "copy to clipboard" page
- *   GET         /whatsapp/qr/{secret}    <- the WhatsApp QR image
+ *   GET         /whatsapp/qr/{secret}    <- the page you scan to link WhatsApp
  *
  * Delivery guarantee:
  *   1. the lead is written to logs/leads-YYYY-MM-DD.jsonl
@@ -30,6 +30,7 @@ import { config, leadUrl, validateConfig } from './src/config.js';
 import { collectInput, isUsable, normalize, parseMultipart } from './src/lead.js';
 import { sendLead, verifyTransport } from './src/mailer.js';
 import { renderCopyPage } from './src/copyPage.js';
+import { renderWaitingHtml } from './src/qrpage.js';
 import {
     appendLead,
     basename,
@@ -155,16 +156,49 @@ function handleCopy(res, url) {
 }
 
 /**
- * The WhatsApp QR image, so it can be scanned from another device.
+ * The WhatsApp linking code, as a page you can scan off the screen.
  *
  * Guarded by PATH_SECRET on purpose: anybody who could read this could link
  * their own WhatsApp to this session.
+ *
+ * WhatsApp rotates the code every ~20 seconds, so the page reloads itself.
+ * When only a PNG arrives from the provider we serve that image instead.
  */
 function handleQr(res) {
     const status = whatsappStatus();
-    const file = status.qrFile ? path.join(config.logs.dir, status.qrFile) : null;
 
-    if (!file || !fs.existsSync(file)) {
+    if (!status.qrFile) {
+        // Between one linking attempt ending and the next code arriving, an
+        // empty 404 looks like a broken page. Say what is actually happening.
+        if (status.enabled && status.status !== 'ready' && status.status !== 'disabled') {
+            return reply(
+                res,
+                202,
+                renderWaitingHtml(status.lastError && /qr_timeout/i.test(status.lastError)
+                    ? 'The previous code expired before it was scanned. A new one is on the way.'
+                    : null),
+                'text/html; charset=utf-8',
+            );
+        }
+
+        return reply(res, 404, 'No QR code is waiting. WhatsApp is either already linked or switched off - see /health.');
+    }
+
+    const page = path.join(config.logs.dir, 'whatsapp-qr.html');
+
+    if (fs.existsSync(page)) {
+        res.writeHead(200, {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store, must-revalidate',
+        });
+        res.end(fs.readFileSync(page));
+
+        return undefined;
+    }
+
+    const file = path.join(config.logs.dir, status.qrFile);
+
+    if (!fs.existsSync(file)) {
         return reply(res, 404, 'No QR code is waiting. See /health for the WhatsApp status.');
     }
 
@@ -180,6 +214,31 @@ function handleQr(res) {
         'Cache-Control': 'no-store',
     });
     res.end(image);
+
+    return undefined;
+}
+
+/**
+ * Close and reopen the WhatsApp client.
+ *
+ * Besides being a handy "reconnect without restarting the service", this is
+ * what writes the session file: open-wa only flushes its encrypted session on a
+ * clean shutdown, so killing the process means scanning the QR again. Watch
+ * /health for the status.
+ */
+function handleWhatsappReload(res) {
+    if (!config.whatsapp.enabled) {
+        return reply(res, 409, 'WhatsApp sending is switched off (WHATSAPP_ENABLED=false).');
+    }
+
+    reply(res, 202, 'Reconnecting WhatsApp. Watch /health for the status.\n');
+
+    (async () => {
+        await stopWhatsapp();
+        await startWhatsapp();
+    })().catch((error) => {
+        log.error('Could not reload the WhatsApp client', { error: String(error?.message || error) });
+    });
 
     return undefined;
 }
@@ -232,10 +291,27 @@ async function deliverQueued(file, data) {
 }
 
 /**
+ * Outbox entries written before audiences existed stored plain numbers; treat
+ * those as customer messages so an old queue still drains.
+ */
+function asRecipient(value) {
+    if (value && typeof value === 'object') {
+        return {
+            number: String(value.number ?? ''),
+            audience: value.audience === 'team' ? 'team' : 'lead',
+        };
+    }
+
+    return { number: String(value ?? ''), audience: 'lead' };
+}
+
+/**
  * Send the WhatsApp message(s) for one outbox entry.
  *
- * The entry keeps a `pending` list of numbers and a `sent_to` list, so a retry
- * never re-messages somebody who already got it.
+ * The entry keeps a `pending` list of recipients and a `sent_to` list, so a
+ * retry never re-messages somebody who already got it. Each recipient carries
+ * its own audience, because your team gets the lead card while the customer
+ * gets the greeting.
  */
 async function deliverWhatsappQueued(file, data) {
     if (whatsappInFlight.has(file)) return false;
@@ -249,7 +325,7 @@ async function deliverWhatsappQueued(file, data) {
             ...data,
             attempts: Number(data.attempts || 0) + 1,
             sent_to: Array.isArray(data.sent_to) ? [...data.sent_to] : [],
-            pending: Array.isArray(data.pending) ? [...data.pending] : [],
+            pending: (Array.isArray(data.pending) ? data.pending : []).map(asRecipient),
         };
 
         if (!entry.pending.length) {
@@ -257,25 +333,25 @@ async function deliverWhatsappQueued(file, data) {
             return true;
         }
 
-        const text = renderWhatsappMessage(lead);
         let lastError = null;
 
         while (entry.pending.length) {
-            const number = entry.pending[0];
+            const recipient = entry.pending[0];
 
             try {
-                await sendWhatsappText(number, text);
+                await sendWhatsappText(recipient.number, renderWhatsappMessage(lead, recipient.audience));
             } catch (error) {
                 lastError = error;
-                break; // keep this number for the next attempt
+                break; // keep this recipient for the next attempt
             }
 
-            entry.sent_to.push(number);
+            entry.sent_to.push(recipient.number);
             entry.pending.shift();
 
             log.info('WhatsApp message sent', {
                 leadId: lead.leadId || null,
-                to: number,
+                to: recipient.number,
+                audience: recipient.audience,
                 remaining: entry.pending.length,
             });
 
@@ -300,7 +376,7 @@ async function deliverWhatsappQueued(file, data) {
 
         log.error('WhatsApp message FAILED - kept in the outbox', {
             leadId: lead.leadId || null,
-            to: entry.pending,
+            to: entry.pending.map((item) => item.number),
             attempts: entry.attempts,
             maxAttempts: config.whatsapp.maxAttempts,
             error: entry.last_error,
@@ -335,7 +411,10 @@ function enqueueWhatsapp(lead) {
     const queued = enqueue('whatsapp', lead, { pending });
 
     if (queued) {
-        log.info('WhatsApp message queued', { leadId: lead.leadId || null, pending });
+        log.info('WhatsApp message queued', {
+            leadId: lead.leadId || null,
+            pending: pending.map((item) => `${item.number} (${item.audience})`),
+        });
     }
 
     return queued;
@@ -461,6 +540,10 @@ async function handle(req, res) {
 
     if (req.method === 'GET' && config.pathSecret && path === `/whatsapp/qr/${config.pathSecret}`) {
         return handleQr(res);
+    }
+
+    if (req.method === 'POST' && config.pathSecret && path === `/whatsapp/reload/${config.pathSecret}`) {
+        return handleWhatsappReload(res);
     }
 
     if (path === leadPath && (req.method === 'GET' || req.method === 'POST')) {

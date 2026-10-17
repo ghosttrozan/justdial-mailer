@@ -38,6 +38,29 @@ const DEFAULT_WHATSAPP_MESSAGE = [
     '- {{business}}',
 ].join('\n');
 
+/**
+ * The default WhatsApp message sent to YOUR team - the lead itself.
+ *
+ * This is deliberately not the customer greeting: the team wants the enquiry
+ * details, not a polite hello. Empty fields drop their whole line (see
+ * renderTeamMessage), so a half-filled lead still reads cleanly.
+ */
+const DEFAULT_WHATSAPP_TEAM_MESSAGE = [
+    '*New JustDial Lead*',
+    '',
+    '*Name:* {{fullname}}',
+    '*Mobile:* {{mobile}}',
+    '*Phone:* {{phone}}',
+    '*Email:* {{email}}',
+    '*Service:* {{category}}',
+    '*Company:* {{company}}',
+    '*Address:* {{address}}',
+    '*Lead ID:* {{leadid}}',
+    '*Received:* {{date}} {{time}}',
+    '',
+    'Source: JustDial',
+].join('\n');
+
 export const config = {
     rootDir,
 
@@ -122,7 +145,11 @@ export const config = {
         respectDnc: bool(process.env.WHATSAPP_RESPECT_DNC, true),
 
         // --- the message ---
+        // To the lead (the customer). Only used when sendToLead is on.
         message: process.env.WHATSAPP_MESSAGE || DEFAULT_WHATSAPP_MESSAGE,
+
+        // To your team numbers. This is the lead card.
+        teamMessage: process.env.WHATSAPP_TEAM_MESSAGE || DEFAULT_WHATSAPP_TEAM_MESSAGE,
 
         // --- pacing, so WhatsApp never sees a burst ---
         minDelaySeconds: int(process.env.WHATSAPP_MIN_DELAY_SECONDS, 5),
@@ -134,6 +161,12 @@ export const config = {
         // How long a send waits for the WhatsApp client to come up before it
         // gives up and lets the retry loop try again later.
         startTimeoutSeconds: int(process.env.WHATSAPP_START_TIMEOUT_SECONDS, 120),
+
+        // open-wa stops waiting for a scan after a few minutes, which leaves the
+        // linking page dead just as somebody finally reaches for their phone.
+        // Offer a fresh code instead of going quiet.
+        startRetries: int(process.env.WHATSAPP_START_RETRIES, 10),
+        startRetrySeconds: int(process.env.WHATSAPP_START_RETRY_SECONDS, 15),
     },
 
     logs: {

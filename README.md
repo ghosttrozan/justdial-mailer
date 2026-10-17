@@ -278,11 +278,12 @@ On startup the service immediately retries anything left in the outbox.
 | `WHATSAPP_PROVIDER` | `openwa` | `openwa` (in process) or `webhook` |
 | `WHATSAPP_WEBHOOK_URL` | *(empty)* | Gateway URL for the `webhook` provider |
 | `WHATSAPP_SESSION_DIR` | `.wa-session` | Where the WhatsApp login is kept |
-| `WHATSAPP_SEND_TO_LEAD` | `true` | Message the lead's own number |
-| `WHATSAPP_TEAM_NUMBERS` | *(empty)* | Extra numbers to copy in |
+| `WHATSAPP_SEND_TO_LEAD` | `true` | Also greet the lead's own number |
+| `WHATSAPP_TEAM_NUMBERS` | *(empty)* | Your team's numbers - they get the lead card |
 | `WHATSAPP_BLOCKLIST` | *(empty)* | Numbers to never message |
 | `WHATSAPP_RESPECT_DNC` | `true` | Honour JustDial's DNC flag |
-| `WHATSAPP_MESSAGE` | built-in | The message template |
+| `WHATSAPP_TEAM_MESSAGE` | built-in lead card | Template for your team |
+| `WHATSAPP_MESSAGE` | built-in greeting | Template for the lead |
 | `BUSINESS_NAME` | *(empty)* | Fills `{{business}}` |
 
 `MAIL_SUBJECT` placeholders: `{{name}}`, `{{mobile}}`, `{{phone}}`, `{{company}}`,
@@ -292,9 +293,25 @@ On startup the service immediately retries anything left in the outbox.
 
 ## 9. Sending the lead to WhatsApp
 
-With `WHATSAPP_ENABLED=true` every new lead is also sent as a WhatsApp message
-to **the customer's own number** - the one JustDial just gave you.
-`WHATSAPP_TEAM_NUMBERS` copies your sales team in as well.
+With `WHATSAPP_ENABLED=true` every new lead is also sent as a WhatsApp message.
+**Your own numbers always get the lead itself** - name, mobile, service, city,
+lead id - so the enquiry reaches your team the moment JustDial sends it:
+
+```
+*New JustDial Lead*
+
+*Name:* Mr Ramesh Gupta
+*Mobile:* 9876501234
+*Service:* Interior Designer
+*City:* Pune
+*Lead ID:* JD-123456
+
+Source: JustDial
+```
+
+`WHATSAPP_SEND_TO_LEAD=true` additionally sends the *customer* a polite greeting
+(`WHATSAPP_MESSAGE`). Turn it off when you only want the enquiry forwarded
+inward. A number that is both yours and the lead's gets the lead card.
 
 It is completely independent of email: if WhatsApp is down the email still goes
 out, and the other way round. A failed WhatsApp message waits in
@@ -314,21 +331,58 @@ who already received it**.
 npm install @open-wa/wa-automate   # already listed as an optional dependency
 ```
 
-Set `WHATSAPP_ENABLED=true` and start the service. It prints a QR code in the
-terminal and writes one to **`logs/whatsapp-qr.png`**. On your phone:
-WhatsApp → **Settings → Linked devices → Link a device**, then scan it.
-
-If you cannot see the server's screen, open the QR in a browser instead:
+Set `WHATSAPP_ENABLED=true` and start the service. It prints the code in the
+terminal, writes the raw value to `logs/whatsapp-qr.txt`, and serves a scannable
+page here:
 
 ```
 https://your-domain.com/whatsapp/qr/YOUR_PATH_SECRET
 ```
 
+Open that page, then on your phone go to
+WhatsApp → **Settings → Linked devices → Link a device** and point the camera at
+the screen. (On a local install the same page is at
+`http://localhost:3000/whatsapp/qr/YOUR_PATH_SECRET`.)
+
 > That URL is guarded by `PATH_SECRET` on purpose - anybody who could read it
 > could link their own WhatsApp to your session.
 
-The login is remembered in `WHATSAPP_SESSION_DIR` (`.wa-session/`), so you scan
-once. Keep that folder private, back it up, and delete it to unlink.
+WhatsApp changes the code every ~20 seconds, so the page reloads itself and you
+are always scanning the current one. If a code goes unscanned, the service
+offers a fresh one rather than going quiet - see `WHATSAPP_START_RETRIES`.
+
+The login is remembered in `WHATSAPP_SESSION_DIR` (`.wa-session/`), so you
+should only have to scan once. Keep that folder private, back it up, and delete
+it to unlink.
+
+> To make the session survive restarts, set a session encryption key once and
+> never change it:
+>
+> ```bash
+> openssl rand -base64 32        # paste the result into the value below
+> ```
+>
+> ```
+> WHATSAPP_OPENWA_OPTIONS={"sessionDataEncryptionKey":"<the 44-character value>"}
+> ```
+
+**Leave a clean shutdown before you stop it.** open-wa writes
+`.wa-session/<session>.data.json` while it closes down, not while it runs - so a
+hard kill (`kill -9`, closing the terminal, a power cut) loses the session and
+the next start asks for a QR code again. `Ctrl+C` in the terminal, `pm2 stop`,
+`systemctl stop` and `docker stop` all shut down cleanly.
+
+To force that save without touching the service, ask it to reconnect:
+
+```bash
+curl -X POST https://your-domain.com/whatsapp/reload/YOUR_PATH_SECRET
+```
+
+It answers `202` at once, then closes and reopens the WhatsApp client in the
+background. `.wa-session/<session>.data.json` appears within a few seconds, and
+`/health` shows `ready: true` again - no QR code, because it re-reads the file it
+just wrote. That is the safe way to move the session to another machine too:
+copy the whole `.wa-session/` folder along with it.
 
 **It also needs:**
 
@@ -360,13 +414,21 @@ Any non-2xx answer counts as a failure, so the message is queued and retried.
 
 ### The message
 
-`WHATSAPP_MESSAGE` is a template, and every placeholder is filled from the lead:
+Two templates, same placeholders:
+
+| Variable | Goes to | Default |
+|---|---|---|
+| `WHATSAPP_TEAM_MESSAGE` | `WHATSAPP_TEAM_NUMBERS` - your team | the lead card shown above |
+| `WHATSAPP_MESSAGE` | the customer's number, when `WHATSAPP_SEND_TO_LEAD=true` | a Hinglish greeting |
+
+Every placeholder is filled from the lead:
 
 | Placeholder | Becomes |
 |---|---|
 | `{{name}}` | the person's name, without the prefix |
 | `{{fullname}}` | with the prefix - `Mr Ramesh Gupta` |
 | `{{mobile}}` `{{phone}}` | the numbers JustDial sent |
+| `{{email}}` | the email address, if any |
 | `{{category}}` `{{company}}` | what the enquiry is about |
 | `{{city}}` `{{area}}` `{{address}}` `{{pincode}}` | where it is |
 | `{{leadid}}` `{{leadtype}}` `{{date}}` `{{time}}` | JustDial's own metadata |
@@ -374,6 +436,16 @@ Any non-2xx answer counts as a failure, so the message is queued and retried.
 
 A placeholder with no value disappears, together with the brackets around it, so
 `enquiry ki thi ({{category}}).` still reads properly when the category is empty.
+A whole `*Label:*` line whose value is empty is dropped as well, so a half-filled
+lead never arrives as a column of blank labels.
+
+A custom team card, for example:
+
+```
+WHATSAPP_TEAM_MESSAGE="*Nayi enquiry* 🔔\n\nNaam: {{fullname}}\nMobile: {{mobile}}\nKaam: {{category}}\nJagah: {{city}}\n\nCall kar lena."
+```
+
+(`\n` works inside a `.env` value - keep the whole thing on one line, in quotes.)
 
 ### Test it
 
