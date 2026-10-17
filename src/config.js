@@ -79,6 +79,8 @@ export const config = {
         pass: (process.env.SMTP_PASS || '').trim(),
     },
 
+    resendApiKey: (process.env.RESEND_API_KEY || '').trim(),
+
     mail: {
         from: (process.env.MAIL_FROM || '').trim(),
         fromName: (process.env.MAIL_FROM_NAME || 'JustDial Leads').trim(),
@@ -118,15 +120,17 @@ export const config = {
     whatsapp: {
         enabled: bool(process.env.WHATSAPP_ENABLED, false),
 
+        // 'wwjs'    = the whatsapp-web.js library, in this process. Keeps a real
+        //             Chrome profile, so the link survives a restart.
         // 'openwa'  = the @open-wa/wa-automate library, in this process
         // 'webhook' = POST the message to any WhatsApp HTTP gateway
-        provider: (process.env.WHATSAPP_PROVIDER || 'openwa').trim().toLowerCase(),
+        provider: (process.env.WHATSAPP_PROVIDER || 'wwjs').trim().toLowerCase(),
 
         // --- provider: webhook ---
         webhookUrl: (process.env.WHATSAPP_WEBHOOK_URL || '').trim(),
         webhookToken: (process.env.WHATSAPP_WEBHOOK_TOKEN || '').trim(),
 
-        // --- provider: openwa ---
+        // --- provider: openwa / wwjs ---
         sessionId: (process.env.WHATSAPP_SESSION_ID || 'justdial-mailer').trim(),
         sessionDir: path.isAbsolute(process.env.WHATSAPP_SESSION_DIR || '')
             ? process.env.WHATSAPP_SESSION_DIR
@@ -192,14 +196,17 @@ export function leadUrl(baseUrl = `http://localhost:${config.port}`) {
 export function validateConfig() {
     const problems = [];
 
-    if (!config.smtp.user) problems.push('SMTP_USER is empty');
-    if (!config.smtp.pass) problems.push('SMTP_PASS is empty');
+    if (!config.resendApiKey) {
+        if (!config.smtp.user) problems.push('SMTP_USER is empty (or provide RESEND_API_KEY)');
+        if (!config.smtp.pass) problems.push('SMTP_PASS is empty (or provide RESEND_API_KEY)');
+        if (!config.mail.from && !config.smtp.user) problems.push('MAIL_FROM is empty');
+    }
+
     if (!config.mail.to.length) problems.push('MAIL_TO is empty');
-    if (!config.mail.from && !config.smtp.user) problems.push('MAIL_FROM is empty');
 
     if (config.whatsapp.enabled) {
-        if (!['openwa', 'webhook'].includes(config.whatsapp.provider)) {
-            problems.push(`WHATSAPP_PROVIDER "${config.whatsapp.provider}" is not known (use openwa or webhook)`);
+        if (!['openwa', 'wwjs', 'webhook'].includes(config.whatsapp.provider)) {
+            problems.push(`WHATSAPP_PROVIDER "${config.whatsapp.provider}" is not known (use wwjs, openwa or webhook)`);
         }
 
         if (config.whatsapp.provider === 'webhook' && !config.whatsapp.webhookUrl) {

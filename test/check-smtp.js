@@ -9,13 +9,21 @@
 import { config, validateConfig } from '../src/config.js';
 import { verifyTransport } from '../src/mailer.js';
 
-console.log('SMTP settings being used:');
-console.log(`  host   : ${config.smtp.host}:${config.smtp.port} (secure=${config.smtp.secure})`);
-console.log(`  user   : ${config.smtp.user || '(not set)'}`);
-console.log(`  pass   : ${config.smtp.pass ? '*'.repeat(config.smtp.pass.length) : '(not set)'}`);
-console.log(`  from   : ${config.mail.from || '(falls back to SMTP_USER)'}`);
-console.log(`  to     : ${config.mail.to.join(', ') || '(not set)'}`);
-console.log(`  dry run: ${config.dryRun}`);
+if (config.resendApiKey) {
+    console.log('Email provider: Resend HTTP API');
+    console.log(`  api key: ${config.resendApiKey.slice(0, 6)}... (length=${config.resendApiKey.length})`);
+    console.log(`  from   : ${config.mail.from || 'onboarding@resend.dev (default)'}`);
+    console.log(`  to     : ${config.mail.to.join(', ') || '(not set)'}`);
+    console.log(`  dry run: ${config.dryRun}`);
+} else {
+    console.log('Email provider: SMTP');
+    console.log(`  host   : ${config.smtp.host}:${config.smtp.port} (secure=${config.smtp.secure})`);
+    console.log(`  user   : ${config.smtp.user || '(not set)'}`);
+    console.log(`  pass   : ${config.smtp.pass ? '*'.repeat(config.smtp.pass.length) : '(not set)'}`);
+    console.log(`  from   : ${config.mail.from || '(falls back to SMTP_USER)'}`);
+    console.log(`  to     : ${config.mail.to.join(', ') || '(not set)'}`);
+    console.log(`  dry run: ${config.dryRun}`);
+}
 console.log('');
 
 const problems = validateConfig();

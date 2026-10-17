@@ -28,10 +28,51 @@ export function getTransporter() {
 }
 
 /**
- * Boot-time SMTP check. Returns { ok, message } - never throws.
+ * Send email via Resend HTTP API (HTTPS port 443 - zero firewall port blocks on Render/Vercel/Railway).
+ */
+export async function sendViaResend({ from, to, cc, replyTo, subject, text, html, leadId }) {
+    const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${config.resendApiKey}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            from,
+            to,
+            cc: cc?.length ? cc : undefined,
+            reply_to: replyTo || undefined,
+            subject,
+            text,
+            html,
+            headers: leadId ? { 'X-JustDial-Lead-Id': leadId } : undefined,
+        }),
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+        throw new Error(`Resend API error (${response.status}): ${data.message || JSON.stringify(data)}`);
+    }
+
+    return {
+        messageId: data.id,
+        accepted: to,
+        rejected: [],
+        response: `Resend ID: ${data.id}`,
+        subject,
+    };
+}
+
+/**
+ * Boot-time SMTP / HTTP check. Returns { ok, message } - never throws.
  */
 export async function verifyTransport() {
     if (config.dryRun) return { ok: true, message: 'DRY_RUN is on - email is not actually sent.' };
+
+    if (config.resendApiKey) {
+        return { ok: true, message: 'Email provider: Resend HTTP API (HTTPS port 443 - Render friendly)' };
+    }
 
     try {
         await getTransporter().verify();
@@ -302,6 +343,22 @@ export async function sendLead(lead) {
         log.info('DRY_RUN - email NOT sent', { to: config.mail.to, subject });
         log.info('DRY_RUN email body\n' + text);
         return { dryRun: true, subject };
+    }
+
+    if (config.resendApiKey) {
+        const fromAddress = config.mail.from || 'onboarding@resend.dev';
+        const from = `"${config.mail.fromName}" <${fromAddress}>`;
+
+        return sendViaResend({
+            from,
+            to: config.mail.to,
+            cc: config.mail.cc.length ? config.mail.cc : undefined,
+            replyTo: lead.email && lead.email.includes('@') ? lead.email : undefined,
+            subject,
+            text,
+            html,
+            leadId: lead.leadId,
+        });
     }
 
     const info = await getTransporter().sendMail({

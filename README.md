@@ -275,7 +275,7 @@ On startup the service immediately retries anything left in the outbox.
 | `DEFAULT_COUNTRY_CODE` | `91` | Prefixed to bare 10 digit numbers for Call / WhatsApp |
 | `WHATSAPP_GREETING` | see `.env.example` | Pre-filled WhatsApp text (`{{name}}` allowed) |
 | `WHATSAPP_ENABLED` | `false` | Also send the lead to WhatsApp |
-| `WHATSAPP_PROVIDER` | `openwa` | `openwa` (in process) or `webhook` |
+| `WHATSAPP_PROVIDER` | `wwjs` | `wwjs` / `openwa` (in process) or `webhook` |
 | `WHATSAPP_WEBHOOK_URL` | *(empty)* | Gateway URL for the `webhook` provider |
 | `WHATSAPP_SESSION_DIR` | `.wa-session` | Where the WhatsApp login is kept |
 | `WHATSAPP_SEND_TO_LEAD` | `true` | Also greet the lead's own number |
@@ -322,13 +322,14 @@ who already received it**.
 
 | `WHATSAPP_PROVIDER` | What it does |
 |---|---|
-| `openwa` *(default)* | Runs the [open-wa](https://github.com/open-wa/wa-automate-nodejs) library inside this service. You link it to your own WhatsApp once by scanning a QR code. |
+| `wwjs` *(default)* | Runs [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js). You link it to your own WhatsApp once by scanning a QR code. It keeps a real Chrome profile on disk, so the link survives restarts. |
+| `openwa` | Runs [open-wa](https://github.com/open-wa/wa-automate-nodejs). Same idea, but its v5 session file is written from an in-page patch that is often missing, so it usually asks for a QR code again after a restart. |
 | `webhook` | POSTs the message as JSON to any WhatsApp gateway you already have - [WAHA](https://waha.devlike.pro/), n8n, Make, your own bot. Nothing extra to install. |
 
-### Provider `openwa` - the one-time QR scan
+### Linking it once (`wwjs` and `openwa`)
 
 ```bash
-npm install @open-wa/wa-automate   # already listed as an optional dependency
+npm install                    # whatsapp-web.js is already in package.json
 ```
 
 Set `WHATSAPP_ENABLED=true` and start the service. It prints the code in the
@@ -351,44 +352,35 @@ WhatsApp changes the code every ~20 seconds, so the page reloads itself and you
 are always scanning the current one. If a code goes unscanned, the service
 offers a fresh one rather than going quiet - see `WHATSAPP_START_RETRIES`.
 
-The login is remembered in `WHATSAPP_SESSION_DIR` (`.wa-session/`), so you
-should only have to scan once. Keep that folder private, back it up, and delete
-it to unlink.
+**That scan is the only one.** The link is remembered in `WHATSAPP_SESSION_DIR`
+(`.wa-session/`):
 
-> To make the session survive restarts, set a session encryption key once and
-> never change it:
->
-> ```bash
-> openssl rand -base64 32        # paste the result into the value below
-> ```
->
-> ```
-> WHATSAPP_OPENWA_OPTIONS={"sessionDataEncryptionKey":"<the 44-character value>"}
-> ```
+| Provider | What is stored | Survives a hard kill? |
+|---|---|---|
+| `wwjs` | a full Chrome profile in `session-<WHATSAPP_SESSION_ID>/` | **yes** - written as you go |
+| `openwa` | `<WHATSAPP_SESSION_ID>.data.json` | no - written only on a clean shutdown |
 
-**Leave a clean shutdown before you stop it.** open-wa writes
-`.wa-session/<session>.data.json` while it closes down, not while it runs - so a
-hard kill (`kill -9`, closing the terminal, a power cut) loses the session and
-the next start asks for a QR code again. `Ctrl+C` in the terminal, `pm2 stop`,
-`systemctl stop` and `docker stop` all shut down cleanly.
+Keep that folder private, back it up, and delete it to unlink. To move the link
+to another machine, copy the whole `.wa-session/` folder along with the rest of
+the service.
 
-To force that save without touching the service, ask it to reconnect:
+To reconnect on demand - handy after editing code, and a quick way to prove the
+session is on disk - ask the service to cycle the client:
 
 ```bash
 curl -X POST https://your-domain.com/whatsapp/reload/YOUR_PATH_SECRET
 ```
 
 It answers `202` at once, then closes and reopens the WhatsApp client in the
-background. `.wa-session/<session>.data.json` appears within a few seconds, and
-`/health` shows `ready: true` again - no QR code, because it re-reads the file it
-just wrote. That is the safe way to move the session to another machine too:
-copy the whole `.wa-session/` folder along with it.
+background. `/health` goes back to `ready: true` **without a QR code**, because
+it re-reads the session from disk. (With `openwa` this is also what saves the
+session, so prefer it over killing the process.)
 
 **It also needs:**
 
 - A Chrome or Chromium on the machine - set `WHATSAPP_CHROME_PATH` if it lives
   somewhere unusual
-- On Linux, the `zstd` binary: `apt-get install -y zstd` (open-wa uses it)
+- On Linux with `openwa`, the `zstd` binary: `apt-get install -y zstd`
 
 If either is missing, the service says exactly what is wrong and **keeps
 working** - leads still go out by email, and the WhatsApp message stays queued.

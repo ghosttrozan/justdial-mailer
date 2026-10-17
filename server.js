@@ -609,7 +609,7 @@ async function main() {
 
     const smtp = await verifyTransport();
     if (smtp.ok) log.info(smtp.message);
-    else log.error('SMTP check failed', { error: smtp.message });
+    else log.error('Email transport check failed', { error: smtp.message });
 
     const queuedAtBoot = countQueued('email') + (config.whatsapp.enabled ? countQueued('whatsapp') : 0);
 
