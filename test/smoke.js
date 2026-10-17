@@ -10,7 +10,28 @@
  */
 import { config, leadUrl } from '../src/config.js';
 
-const base = process.argv[2] || `http://localhost:${config.port}`;
+const argv = process.argv.slice(2);
+const flags = argv.filter((arg) => arg.startsWith('--'));
+const base = argv.find((arg) => !arg.startsWith('--')) || `http://localhost:${config.port}`;
+const confirmed = flags.includes('--yes');
+
+/**
+ * This test pushes real leads through the real endpoint, so with DRY_RUN=false
+ * it sends REAL emails. Make that explicit before it happens.
+ */
+if (!config.dryRun && config.mail.to.length && !confirmed) {
+    console.log('');
+    console.log('STOP - this smoke test would send REAL emails.');
+    console.log(`  Recipient : ${config.mail.to.join(', ')}`);
+    console.log('  It fires one lead per input format, so you get several messages.');
+    console.log('');
+    console.log('  To run it:');
+    console.log('    npm run test:smoke -- --yes       (send for real)');
+    console.log('    $env:DRY_RUN="true"; npm run test:smoke   (send nothing)');
+    console.log('');
+    process.exit(1);
+}
+
 const target = leadUrl(base);
 const stamp = Date.now();
 const results = [];
@@ -99,6 +120,19 @@ await check('GET mixed casing + stray ">>"', async () => {
 
 await check('GET with no fields at all', async () => {
     return (await fetch(target)).text();
+});
+
+await check('copy page renders the value', async () => {
+    const res = await fetch(`${base}${config.copyPath}?label=Mobile&text=9876543210`);
+    const html = await res.text();
+    return res.status === 200 && html.includes('9876543210') ? 'RECEIVED' : `status ${res.status}`;
+});
+
+await check('copy page escapes injected html', async () => {
+    const res = await fetch(`${base}${config.copyPath}?text=${encodeURIComponent('<script>alert(1)</script>')}`);
+    const html = await res.text();
+    const leaked = html.includes('<script>alert(1)</script>');
+    return !leaked && html.includes('&lt;script&gt;') ? 'RECEIVED' : 'value was not escaped';
 });
 
 await check('health endpoint returns JSON', async () => {

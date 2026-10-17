@@ -55,6 +55,20 @@ export const config = {
     // Used to stamp "received at" in the email.
     timezone: process.env.TIMEZONE || 'Asia/Kolkata',
 
+    // Public base URL used to build the "Copy" links inside the email.
+    // Leave empty and it is derived from the request that delivered the lead,
+    // which is correct behind nginx/Cloudflare without any configuration.
+    publicUrl: (process.env.PUBLIC_URL || '').trim().replace(/\/+$/, ''),
+
+    // Path of the little "copy to clipboard" page the email buttons link to.
+    copyPath: (process.env.COPY_PATH || '/copy').trim() || '/copy',
+
+    // JustDial is India-only; 10 digit numbers get this prefixed for tel:/wa.me.
+    countryCode: (process.env.DEFAULT_COUNTRY_CODE || '91').replace(/\D/g, '') || '91',
+
+    // Pre-filled WhatsApp message when the "WhatsApp" button is tapped.
+    whatsappGreeting: process.env.WHATSAPP_GREETING || 'Hello {{name}}, thank you for your enquiry on JustDial. How can we help you?',
+
     logs: {
         dir: path.isAbsolute(process.env.LOG_DIR || '')
             ? process.env.LOG_DIR

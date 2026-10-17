@@ -14,6 +14,8 @@ JustDial  ──GET/POST──►  /justdial/lead  ──►  📧  your inbox
 - Accepts **GET, POST, JSON, form-urlencoded, form-data and query strings**
 - Every lead is saved to disk **before** the reply, so nothing is ever lost
 - If the mail server is down the lead waits in an **outbox** and is retried automatically
+- Clean lead email with **Call / WhatsApp / Maps** buttons
+- **Copy button on every field**, plus a **Copy all** button
 - Optional duplicate window (JustDial retries on timeout)
 - Zero frameworks — just Node's `http`, `nodemailer` and `busboy`
 
@@ -123,6 +125,21 @@ The reply should be `RECEIVED` and an email should land in `MAIL_TO`.
 
 **No SMTP yet?** Set `DRY_RUN=true` and the email content is printed to the
 console instead of being sent — perfect for a first run.
+
+**Heads up:** `npm run test:smoke` pushes real leads through the endpoint, so
+with `DRY_RUN=false` it sends **real emails** — one for each input format.
+It refuses to run until you pass `--yes`:
+
+```bash
+npm run test:smoke -- --yes              # send for real
+$env:DRY_RUN="true"; npm run test:smoke  # send nothing
+```
+
+**Preview the email design without sending anything:**
+
+```bash
+npm run preview          # writes logs/preview.html
+```
 
 **Health check** (good for uptime monitors):
 
@@ -250,13 +267,56 @@ On startup the service immediately retries anything left in the outbox.
 | `MAX_SEND_ATTEMPTS` | `10` | Give up after N tries |
 | `TIMEZONE` | `Asia/Kolkata` | Timezone used in the email timestamp |
 | `LOG_DIR` | `logs` | Where logs live |
+| `PUBLIC_URL` | auto-detected | Base URL used for the copy links |
+| `COPY_PATH` | `/copy` | Path of the copy-to-clipboard page |
+| `DEFAULT_COUNTRY_CODE` | `91` | Prefixed to bare 10 digit numbers for Call / WhatsApp |
+| `WHATSAPP_GREETING` | see `.env.example` | Pre-filled WhatsApp text (`{{name}}` allowed) |
 
 `MAIL_SUBJECT` placeholders: `{{name}}`, `{{mobile}}`, `{{phone}}`, `{{company}}`,
 `{{city}}`, `{{category}}`, `{{area}}`, `{{leadid}}`.
 
 ---
 
-## 9. Troubleshooting
+## 9. The buttons in the lead email
+
+Mail clients strip JavaScript, so a copy button **cannot** copy on its own.
+Instead each copy button is an ordinary link to a tiny page on your own
+`PUBLIC_URL` (`/copy`), which puts the value on the clipboard — one tap, works
+in Gmail, Outlook and on mobile.
+
+The header carries a **Copy all** button that copies the whole lead as tidy
+text, ready to paste into WhatsApp or your CRM:
+
+```
+Lead ID    : JD-UI-20261017134611
+Name       : Mr Ramesh Gupta
+Mobile     : 9876501234
+Phone      : 02224567890
+Email      : ramesh.gupta@example.com
+Requirement: Interior Designer
+Company    : Sharma Interiors & Decor
+Address    : Kothrud, Baner, Pune, 411038
+Received   : 17 Oct 2026, 1:46 pm
+```
+
+The other buttons need no configuration:
+
+| Button | Opens |
+|---|---|
+| **Call** | `tel:+91...` — dials from the phone |
+| **WhatsApp** | `wa.me/91...` with a pre-filled greeting |
+| **Open in Maps** | Google Maps search for the lead's address |
+
+> The copy links point at whatever host the lead arrived on. Behind
+> nginx/Cloudflare that is automatic. If your email must show a specific
+> domain, set `PUBLIC_URL`.
+
+`MAIL_SUBJECT` placeholders: `{{name}}`, `{{mobile}}`, `{{phone}}`, `{{company}}`,
+`{{city}}`, `{{category}}`, `{{area}}`, `{{leadid}}`.
+
+---
+
+## 10. Troubleshooting
 
 **`RECEIVED` but no email**
 Run `npm run test:smtp`. Usually a normal Gmail password was used instead of an
@@ -284,7 +344,7 @@ JustDial, and that the URL is not missing it.
 
 ---
 
-## 10. Local smoke test without Gmail
+## 11. Local smoke test without Gmail
 
 ```ini
 DRY_RUN=true

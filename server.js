@@ -23,6 +23,7 @@ import http from 'node:http';
 import { config, leadUrl, validateConfig } from './src/config.js';
 import { collectInput, isUsable, normalize, parseMultipart } from './src/lead.js';
 import { sendLead, verifyTransport } from './src/mailer.js';
+import { renderCopyPage } from './src/copyPage.js';
 import {
     appendLead,
     basename,
@@ -91,6 +92,40 @@ function received(res) {
 }
 
 /**
+ * The public URL this request came in on, so the "Copy" links inside the
+ * email point at a host the recipient can actually reach. Honours the
+ * X-Forwarded-* headers set by nginx / Cloudflare.
+ */
+function requestBaseUrl(req) {
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+    const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
+
+    const proto = forwardedProto || (req.socket.encrypted ? 'https' : 'http');
+    const host = forwardedHost || req.headers.host || `localhost:${config.port}`;
+
+    return `${proto}://${host}`;
+}
+
+/**
+ * The page the email's "Copy" buttons open. The value travels in the URL and
+ * is escaped on the way out, so nothing is stored and nothing leaks.
+ */
+function handleCopy(res, url) {
+    const text = (url.searchParams.get('text') || '').slice(0, 4000);
+    const label = (url.searchParams.get('label') || '').slice(0, 60);
+
+    res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Robots-Tag': 'noindex, nofollow',
+        'Referrer-Policy': 'no-referrer',
+        'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+    });
+
+    res.end(renderCopyPage({ text, label }));
+}
+
+/**
  * Email one outbox entry. On success the entry is removed; on failure it stays
  * put with an extra attempt recorded so the retry loop can try again.
  */
@@ -152,6 +187,7 @@ async function handleLead(req, res) {
 
     const data = collectInput({ url, raw, contentType, multipart });
     const lead = normalize(data);
+    lead.baseUrl = config.publicUrl || requestBaseUrl(req);
 
     log.info('JustDial lead received', {
         method: req.method,
@@ -227,6 +263,10 @@ async function handle(req, res) {
 
     if (req.method === 'GET' && path === config.healthPath) {
         return handleHealth(res);
+    }
+
+    if (req.method === 'GET' && path === config.copyPath.replace(/\/+$/, '')) {
+        return handleCopy(res, url);
     }
 
     if (path === leadPath && (req.method === 'GET' || req.method === 'POST')) {

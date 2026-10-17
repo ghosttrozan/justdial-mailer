@@ -1,6 +1,7 @@
 import nodemailer from 'nodemailer';
 import { config } from './config.js';
 import { KNOWN_FIELDS } from './lead.js';
+import { baseUrlFor, copyLink, mapsLink, telLink, whatsappLink } from './links.js';
 import { log } from './logger.js';
 
 let transporter = null;
@@ -78,23 +79,37 @@ function receivedAtText(lead) {
     }
 }
 
+/**
+ * The lead as one tidy block of text - this is what the "Copy all" button
+ * puts on the clipboard, and what the plain-text email shows.
+ */
+export function leadAsText(lead) {
+    const rows = [
+        ['Lead ID', lead.leadId],
+        ['Name', lead.fullName],
+        ['Mobile', lead.mobile],
+        ['Phone', lead.phone],
+        ['Email', lead.email],
+        ['Requirement', lead.category],
+        ['Company', lead.company],
+        ['Address', lead.address],
+        ['Lead Type', lead.leadType],
+        ['Received', receivedAtText(lead)],
+    ].filter(([, value]) => String(value ?? '').trim().length > 0);
+
+    const width = rows.reduce((max, [key]) => Math.max(max, key.length), 0);
+
+    return rows.map(([key, value]) => `${key.padEnd(width)} : ${value}`).join('\n');
+}
+
 function buildText(lead) {
+    const extra = leadAsText(lead);
+
     const lines = [
         'NEW JUSTDIAL LEAD',
         '='.repeat(40),
         '',
-        `Name       : ${lead.fullName}`,
-        `Mobile     : ${lead.mobile || '-'}`,
-        `Phone      : ${lead.phone || '-'}`,
-        `Email      : ${lead.email || '-'}`,
-        `Company    : ${lead.company || '-'}`,
-        `Category   : ${lead.category || '-'}`,
-        `Address    : ${lead.address || '-'}`,
-        `Lead Type  : ${lead.leadType || '-'}`,
-        `Lead ID    : ${lead.leadId || '-'}`,
-        `Lead Date  : ${[lead.date, lead.time].filter(Boolean).join(' ') || '-'}`,
-        '',
-        `Received   : ${receivedAtText(lead)}`,
+        extra,
         '',
         '-'.repeat(40),
         'ALL RECEIVED FIELDS',
@@ -116,60 +131,160 @@ function buildText(lead) {
     return lines.join('\n');
 }
 
-function row(label, value, href) {
-    if (!value) return '';
-    const cell = href
-        ? `<a href="${escapeHtml(href)}" style="color:#0d6efd;text-decoration:none;">${escapeHtml(value)}</a>`
+/* ------------------------------------------------------------------ *
+ * HTML email
+ * ------------------------------------------------------------------ */
+
+function button(label, href, background, colour) {
+    if (!href) return '';
+
+    return `<a href="${escapeHtml(href)}" style="display:inline-block;margin:0 8px 8px 0;padding:10px 16px;background:${background};color:${colour};font-size:13px;font-weight:700;text-decoration:none;border-radius:9px;">${escapeHtml(label)}</a>`;
+}
+
+function copyPill(url, compact = true) {
+    if (!url) return '';
+
+    const padding = compact ? '5px 10px' : '7px 13px';
+    const size = compact ? '11px' : '12px';
+
+    return `<a href="${escapeHtml(url)}" style="display:inline-block;padding:${padding};background:#f1f5f9;border:1px solid #dfe5ec;border-radius:7px;color:#475569;font-size:${size};font-weight:700;text-decoration:none;white-space:nowrap;">Copy</a>`;
+}
+
+function fieldRow({ label, value, href, copy, last }) {
+    if (!String(value ?? '').trim()) return '';
+
+    const border = last ? 'none' : '1px solid #eef1f5';
+    const shown = href
+        ? `<a href="${escapeHtml(href)}" style="color:#1554d6;text-decoration:none;font-weight:600;">${escapeHtml(value)}</a>`
         : escapeHtml(value);
 
     return `
-        <tr>
-            <td style="padding:9px 14px;border-bottom:1px solid #eef0f3;color:#6b7280;font-size:13px;white-space:nowrap;vertical-align:top;">${escapeHtml(label)}</td>
-            <td style="padding:9px 14px;border-bottom:1px solid #eef0f3;color:#111827;font-size:14px;font-weight:600;word-break:break-word;">${cell}</td>
-        </tr>`;
+            <tr>
+                <td width="118" valign="top" style="padding:11px 12px 11px 0;border-bottom:${border};color:#64748b;font-size:13px;line-height:1.45;">${escapeHtml(label)}</td>
+                <td valign="top" style="padding:11px 10px 11px 0;border-bottom:${border};color:#0f172a;font-size:14px;font-weight:600;line-height:1.5;word-break:break-word;">${shown}</td>
+                <td width="64" valign="top" align="right" style="padding:11px 0;border-bottom:${border};">${copyPill(copy)}</td>
+            </tr>`;
 }
 
 function buildHtml(lead) {
+    const base = baseUrlFor(lead);
+
+    const call = telLink(lead.mobile || lead.phone);
+    const whatsapp = whatsappLink(lead.mobile || lead.phone, lead.fullName);
+    const maps = mapsLink(lead.address);
+
+    const copyAll = copyLink(leadAsText(lead), `${lead.fullName} - JustDial lead`, base);
+    const copyPhone = copyLink(lead.displayPhone, 'Mobile', base);
+
     const known = new Set(KNOWN_FIELDS.map(([key]) => key));
+
+    const rows = [
+        { label: 'Lead ID', value: lead.leadId, copy: copyLink(lead.leadId, 'Lead ID', base) },
+        { label: 'Name', value: lead.fullName, copy: copyLink(lead.fullName, 'Name', base) },
+        { label: 'Mobile', value: lead.mobile, href: telLink(lead.mobile), copy: copyLink(lead.mobile, 'Mobile', base) },
+        { label: 'Phone', value: lead.phone, href: telLink(lead.phone), copy: copyLink(lead.phone, 'Phone', base) },
+        { label: 'Email', value: lead.email, href: lead.email && lead.email.includes('@') ? `mailto:${lead.email}` : null, copy: copyLink(lead.email, 'Email', base) },
+        { label: 'Requirement', value: lead.category, copy: copyLink(lead.category, 'Requirement', base) },
+        { label: 'Company', value: lead.company, copy: copyLink(lead.company, 'Company', base) },
+        { label: 'Address', value: lead.address, href: maps, copy: copyLink(lead.address, 'Address', base) },
+        { label: 'Lead Type', value: lead.leadType, copy: copyLink(lead.leadType, 'Lead Type', base) },
+        { label: 'Lead Date', value: [lead.date, lead.time].filter(Boolean).join(' '), copy: null },
+    ].filter((row) => String(row.value ?? '').trim().length > 0);
 
     const extraRows = Object.entries(lead.raw)
         .filter(([key]) => !known.has(key.toLowerCase()))
-        .map(([key, value]) => row(key, value))
+        .map(([key, value], index, all) => fieldRow({
+            label: key,
+            value,
+            copy: copyLink(value, key, base),
+            last: index === all.length - 1,
+        }))
+        .join('');
+
+    const fieldRows = rows
+        .map((row, index) => fieldRow({ ...row, last: index === rows.length - 1 }))
         .join('');
 
     return `<!doctype html>
-<html>
-<body style="margin:0;padding:24px 12px;background:#f4f6f8;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
-    <div style="max-width:620px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 18px rgba(16,24,40,.08);">
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>New JustDial Lead</title>
+</head>
+<body style="margin:0;padding:0;background:#eef1f5;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#eef1f5;">
+    <tr>
+        <td align="center" style="padding:26px 12px;">
+            <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 6px 24px rgba(16,24,40,.10);font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
 
-        <div style="background:#0d6efd;padding:20px 22px;">
-            <div style="color:#cfe2ff;font-size:12px;letter-spacing:.09em;text-transform:uppercase;font-weight:700;">New JustDial Lead</div>
-            <div style="color:#ffffff;font-size:22px;font-weight:700;margin-top:6px;">${escapeHtml(lead.fullName)}</div>
-            ${lead.displayPhone ? `<div style="color:#e7f0ff;font-size:15px;margin-top:6px;">&#128222; <a href="tel:${escapeHtml(lead.displayPhone)}" style="color:#ffffff;text-decoration:none;font-weight:600;">${escapeHtml(lead.displayPhone)}</a></div>` : ''}
-        </div>
+                <!-- header -->
+                <tr>
+                    <td style="background:#1554d6;padding:22px 24px 20px;">
+                        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                            <tr>
+                                <td style="color:#c7dbff;font-size:11px;font-weight:800;letter-spacing:.11em;text-transform:uppercase;">New JustDial Lead</td>
+                                <td align="right">${copyPill(copyAll, false)}</td>
+                            </tr>
+                        </table>
+                        <div style="margin-top:10px;color:#ffffff;font-size:24px;font-weight:700;line-height:1.25;">${escapeHtml(lead.fullName)}</div>
+                        ${lead.displayPhone ? `<div style="margin-top:8px;"><a href="${escapeHtml(call || '#')}" style="color:#ffffff;font-size:17px;font-weight:700;text-decoration:none;">&#128222; ${escapeHtml(lead.displayPhone)}</a></div>` : ''}
+                    </td>
+                </tr>
 
-        <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
-            ${row('Lead ID', lead.leadId)}
-            ${row('Name', lead.fullName)}
-            ${row('Mobile', lead.mobile, lead.mobile ? `tel:${lead.mobile}` : null)}
-            ${row('Phone', lead.phone, lead.phone ? `tel:${lead.phone}` : null)}
-            ${row('Email', lead.email, lead.email ? `mailto:${lead.email}` : null)}
-            ${row('Requirement', lead.category)}
-            ${row('Company', lead.company)}
-            ${row('Address', lead.address)}
-            ${row('Lead Type', lead.leadType)}
-            ${row('Lead Date', [lead.date, lead.time].filter(Boolean).join(' '))}
-        </table>
+                <!-- quick actions -->
+                ${(call || whatsapp || maps)
+                    ? `<tr>
+                    <td style="padding:18px 24px 10px;">
+                        ${button('Call', call, '#1554d6', '#ffffff')}
+                        ${button('WhatsApp', whatsapp, '#1faa53', '#ffffff')}
+                        ${button('Open in Maps', maps, '#eef1f5', '#0f172a')}
+                        ${copyPhone ? `<a href="${escapeHtml(copyPhone)}" style="display:inline-block;margin:0 8px 8px 0;padding:10px 16px;background:#eef1f5;color:#0f172a;font-size:13px;font-weight:700;text-decoration:none;border-radius:9px;">Copy number</a>` : ''}
+                    </td>
+                </tr>`
+                    : ''}
 
-        ${extraRows ? `
-        <div style="padding:14px 18px 4px;color:#6b7280;font-size:12px;letter-spacing:.06em;text-transform:uppercase;font-weight:700;">Additional fields</div>
-        <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">${extraRows}</table>
-        ` : ''}
+                <!-- fields -->
+                <tr>
+                    <td style="padding:8px 24px 22px;">
+                        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;">
+                            ${fieldRows}
+                        </table>
+                    </td>
+                </tr>
 
-        <div style="padding:16px 22px 22px;color:#9aa2ad;font-size:12px;">
-            Received ${escapeHtml(receivedAtText(lead))} &middot; ${escapeHtml(config.mail.fromName)}
-        </div>
-    </div>
+                ${extraRows
+                    ? `<!-- extra fields -->
+                <tr>
+                    <td style="padding:0 24px 8px;">
+                        <div style="color:#94a3b8;font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;">Additional fields</div>
+                    </td>
+                </tr>
+                <tr>
+                    <td style="padding:8px 24px 22px;">
+                        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;">
+                            ${extraRows}
+                        </table>
+                    </td>
+                </tr>`
+                    : ''}
+
+                <!-- footer -->
+                <tr>
+                    <td style="padding:16px 24px 20px;border-top:1px solid #eef1f5;color:#98a2b3;font-size:12px;line-height:1.6;">
+                        Received ${escapeHtml(receivedAtText(lead))} &middot; ${escapeHtml(config.mail.fromName)}
+                        <br>Copy buttons open a small page that puts the value on your clipboard.
+                    </td>
+                </tr>
+            </table>
+
+            <div style="max-width:600px;margin:14px auto 0;color:#94a3b8;font-size:11px;text-align:center;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+                JustDial Mailer &middot; lead ${escapeHtml(lead.leadId || '')}
+            </div>
+        </td>
+    </tr>
+</table>
 </body>
 </html>`;
 }
@@ -181,6 +296,7 @@ export async function sendLead(lead) {
     const subject = renderSubject(config.mail.subject, lead);
     const text = buildText(lead);
     const html = buildHtml(lead);
+    const listUnsubscribe = `<mailto:${config.mail.from || config.smtp.user}?subject=unsubscribe>`;
 
     if (config.dryRun) {
         log.info('DRY_RUN - email NOT sent', { to: config.mail.to, subject });
@@ -196,6 +312,10 @@ export async function sendLead(lead) {
         subject,
         text,
         html,
+        headers: {
+            'X-JustDial-Lead-Id': lead.leadId || '',
+            'List-Unsubscribe': listUnsubscribe,
+        },
     });
 
     return {
@@ -207,4 +327,4 @@ export async function sendLead(lead) {
     };
 }
 
-export { renderSubject, buildText, buildHtml };
+export { renderSubject, buildText, buildHtml, receivedAtText };

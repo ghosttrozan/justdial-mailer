@@ -13,7 +13,8 @@
     "dev": "node --watch server.js",
     "test:lead": "node test/send-sample.js",
     "test:smoke": "node test/smoke.js",
-    "test:smtp": "node test/check-smtp.js"
+    "test:smtp": "node test/check-smtp.js",
+    "preview": "node test/preview.js"
   },
   "dependencies": {
     "busboy": "^1.6.0",
